@@ -78,7 +78,7 @@ testImage:
   repository:
   # testImage.tag defaults to \"latest\" if omitted
   tag:
-  # testImage.pullPolicy defaults to image.pullPolicy if ommitted
+  # testImage.pullPolicy defaults to image.pullPolicy if omitted
   pullPolicy:
 
 replicaCount: 1
@@ -91,12 +91,32 @@ podAnnotations: {}
 
 podSecurityContext: {}
 
+# Optional priority class to be used for kyverno pods
+priorityClassName: \"\"
+
 antiAffinity:
   # This can be disabled in a 1 node cluster.
   enable: true
-  # By default this will make sure two pods don't end up on the same node
-  # Changing this to a region would allow you to spread pods across regions
-  topologyKey: \"kubernetes.io/hostname\"
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 1
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: app.kubernetes.io/name
+            operator: In
+            values:
+            - kyverno
+        topologyKey: kubernetes.io/hostname
+
+podDisruptionBudget:
+  minAvailable: 1
+  # maxUnavailable: 1
+
+  # minAvailable and maxUnavailable can either be set to an integer (e.g. 1)
+  # or a percentage value (e.g. 25%)
 
 nodeSelector: {}
 tolerations: []
@@ -118,14 +138,14 @@ envVarsInit: {}
 envVars: {}
 
 extraArgs: []
-# - --webhooktimeout=4
+# - --webhookTimeout=4
 
 resources:
   limits:
-    memory: 256Mi
+    memory: 384Mi
   requests:
     cpu: 100m
-    memory: 50Mi
+    memory: 128Mi
 
 initResources:
   limits:
@@ -198,13 +218,13 @@ config:
   # Note that it takes a list of namespaceSelector in the JSON format, and only the first element
   # will be forwarded to the webhookconfigurations.
   webhooks:
-  # webhooks: [{\"namespaceSelector\":{\"matchExpressions\":[{\"key\":\"environment\",\"operator\":\"In\",\"values\":[\"prod\"]}]}}]
+  # webhooks: [{"namespaceSelector":{"matchExpressions":[{"key":"environment","operator":"In","values":["prod"]}]}}]
   generateSuccessEvents: 'false'
-  # existingConfig: init-config
+  # existingConfig: kyverno
   metricsConfig:
     namespaces: {
-      \"include\": [],
-      \"exclude\": []
+      "include": [],
+      "exclude": []
     }
     # 'namespaces.include': list of namespaces to capture metrics for. Default: metrics being captured for all namespaces except excludeNamespaces.
     # 'namespaces.exclude': list of namespaces to NOT capture metrics for. Default: []
@@ -275,14 +295,19 @@ serviceMonitor:
 # If letting Kyverno create its own CA or providing your own, make createSelfSignedCert is false
 createSelfSignedCert: false
 
+# Whether to have Helm install the Kyverno CRDs
+# If the CRDs are not installed by Helm, they must be added
+# before policies can be created
+installCRDs: true
+
 # When true, use a NetworkPolicy to allow ingress to the webhook
 # This is useful on clusters using Calico and/or native k8s network
 # policies in a default-deny setup.
 networkPolicy:
   enabled: false
-  namespaceExpressions: [{}]
+  namespaceExpressions: []
   namespaceLabels: {}
-  podExpressions: [{}]
+  podExpressions: []
   podLabels: {}
 " > $CHART_LOCATION
 echo "Values generated"
