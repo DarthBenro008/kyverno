@@ -15,3 +15,13 @@ expected:
         namespace: ''
         name: pod-with-default-volume
       rules:
+        - name: annotate-empty-dir
+          type: Mutation
+          status: skip
+          message: "no patches applied"
+        - name: annotate-host-path
+          type: Mutation
+          status: skip
+          message: "no patches applied"
+
+        

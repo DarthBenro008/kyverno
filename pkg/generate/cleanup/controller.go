@@ -3,10 +3,10 @@ package cleanup
 import (
 	"time"
 
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
 	kyvernoclient "github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	kyvernoinformer "github.com/kyverno/kyverno/pkg/client/informers/externalversions/kyverno/v1"
 	kyvernolister "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1"
@@ -170,6 +170,7 @@ func (c *Controller) deletePolicy(obj interface{}) {
 		}
 
 		for _, gr := range grs {
+			logger.V(4).Info("enqueue the gr for cleanup", "gr name", gr.Name)
 			c.addGR(gr)
 		}
 	}
@@ -341,7 +342,10 @@ func (c *Controller) syncGenerateRequest(key string) error {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
-		c.control.Delete(gr.Name)
+		err = c.control.Delete(gr.Name)
+		if err != nil {
+			return err
+		}
 		return nil
 	}
 	return c.processGR(*gr)

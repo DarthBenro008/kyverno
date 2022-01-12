@@ -4,26 +4,44 @@ Cleans up stale webhookconfigurations created by kyverno that were not cleanedup
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/kyverno/kyverno/pkg/config"
 	client "github.com/kyverno/kyverno/pkg/dclient"
+	"github.com/kyverno/kyverno/pkg/leaderelection"
+	"github.com/kyverno/kyverno/pkg/policyreport"
 	"github.com/kyverno/kyverno/pkg/signal"
+	"github.com/kyverno/kyverno/pkg/tls"
 	"github.com/kyverno/kyverno/pkg/utils"
+	coord "k8s.io/api/coordination/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	rest "k8s.io/client-go/rest"
-	clientcmd "k8s.io/client-go/tools/clientcmd"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/klogr"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 var (
-	kubeconfig string
-	setupLog   = log.Log.WithName("setup")
+	kubeconfig           string
+	setupLog             = log.Log.WithName("setup")
+	clientRateLimitQPS   float64
+	clientRateLimitBurst int
+
+	updateLabelSelector = &v1.LabelSelector{
+		MatchExpressions: []v1.LabelSelectorRequirement{
+			{
+				Key:      policyreport.LabelSelectorKey,
+				Operator: v1.LabelSelectorOpDoesNotExist,
+				Values:   []string{},
+			},
+		},
+	}
 )
 
 const (
@@ -40,6 +58,8 @@ func main() {
 	log.SetLogger(klogr.New())
 	// arguments
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
+	flag.Float64Var(&clientRateLimitQPS, "clientRateLimitQPS", 0, "Configure the maximum QPS to the master from Kyverno. Uses the client default if zero.")
+	flag.IntVar(&clientRateLimitBurst, "clientRateLimitBurst", 0, "Configure the maximum burst for throttle. Uses the client default if zero.")
 	if err := flag.Set("v", "2"); err != nil {
 		klog.Fatalf("failed to set log level: %v", err)
 	}
@@ -49,7 +69,7 @@ func main() {
 	// os signal handler
 	stopCh := signal.SetupSignalHandler()
 	// create client config
-	clientConfig, err := createClientConfig(kubeconfig)
+	clientConfig, err := config.CreateClientConfig(kubeconfig, clientRateLimitQPS, clientRateLimitBurst, log.Log)
 	if err != nil {
 		setupLog.Error(err, "Failed to build kubeconfig")
 		os.Exit(1)
@@ -80,29 +100,122 @@ func main() {
 		{clusterPolicyViolation, ""},
 	}
 
+	kubeClientLeaderElection, err := utils.NewKubeClient(clientConfig)
+	if err != nil {
+		setupLog.Error(err, "Failed to create kubernetes client")
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		<-stopCh
+		cancel()
+	}()
+
+	addPolicyReportSelectorLabel(client)
+	addClusterPolicyReportSelectorLabel(client)
+
 	done := make(chan struct{})
 	defer close(done)
 	failure := false
-	// use pipline to pass request to cleanup resources
-	// generate requests
-	in := gen(done, stopCh, requests...)
-	// process requests
-	// processing routine count : 2
-	p1 := process(client, done, stopCh, in)
-	p2 := process(client, done, stopCh, in)
-	// merge results from processing routines
-	for err := range merge(done, stopCh, p1, p2) {
+
+	run := func() {
+		certProps, err := tls.GetTLSCertProps(clientConfig)
 		if err != nil {
-			failure = true
-			log.Log.Error(err, "failed to cleanup resource")
+			log.Log.Info("failed to get cert properties: %v", err.Error())
+			os.Exit(1)
 		}
+
+		depl, err := client.GetResource("", "Deployment", getKyvernoNameSpace(), config.KyvernoDeploymentName)
+		deplHash := ""
+		if err != nil {
+			log.Log.Info("failed to fetch deployment '%v': %v", config.KyvernoDeploymentName, err.Error())
+			os.Exit(1)
+		}
+		deplHash = fmt.Sprintf("%v", depl.GetUID())
+
+		name := tls.GenerateRootCASecretName(certProps)
+		secretUnstr, err := client.GetResource("", "Secret", getKyvernoNameSpace(), name)
+		if err != nil {
+			log.Log.Info("failed to fetch secret '%v': %v", name, err.Error())
+
+			if !errors.IsNotFound(err) {
+				os.Exit(1)
+			}
+		} else if tls.CanAddAnnotationToSecret(deplHash, secretUnstr) {
+			secretUnstr.SetAnnotations(map[string]string{tls.MasterDeploymentUID: deplHash})
+			_, err = client.UpdateResource("", "Secret", certProps.Namespace, secretUnstr, false)
+			if err != nil {
+				log.Log.Info("failed to update cert: %v", err.Error())
+				os.Exit(1)
+			}
+		}
+
+		name = tls.GenerateTLSPairSecretName(certProps)
+		secretUnstr, err = client.GetResource("", "Secret", getKyvernoNameSpace(), name)
+		if err != nil {
+			log.Log.Info("failed to fetch secret '%v': %v", name, err.Error())
+
+			if !errors.IsNotFound(err) {
+				os.Exit(1)
+			}
+		} else if tls.CanAddAnnotationToSecret(deplHash, secretUnstr) {
+			secretUnstr.SetAnnotations(map[string]string{tls.MasterDeploymentUID: deplHash})
+			_, err = client.UpdateResource("", "Secret", certProps.Namespace, secretUnstr, false)
+			if err != nil {
+				log.Log.Info("failed to update cert: %v", err.Error())
+				os.Exit(1)
+			}
+		}
+
+		_, err = kubeClientLeaderElection.CoordinationV1().Leases(getKyvernoNameSpace()).Get(ctx, "kyvernopre-lock", v1.GetOptions{})
+		if err != nil {
+			log.Log.Info("Lease 'kyvernopre-lock' not found. Starting clean-up...")
+		} else {
+			log.Log.Info("Clean-up complete. Leader exiting...")
+			os.Exit(0)
+		}
+
+		// use pipline to pass request to cleanup resources
+		// generate requests
+		in := gen(done, stopCh, requests...)
+		// process requests
+		// processing routine count : 2
+		p1 := process(client, done, stopCh, in)
+		p2 := process(client, done, stopCh, in)
+		// merge results from processing routines
+		for err := range merge(done, stopCh, p1, p2) {
+			if err != nil {
+				failure = true
+				log.Log.Error(err, "failed to cleanup resource")
+			}
+		}
+		// if there is any failure then we fail process
+		if failure {
+			log.Log.Info("failed to cleanup prior configurations")
+			os.Exit(1)
+		}
+
+		lease := coord.Lease{}
+		lease.ObjectMeta.Name = "kyvernopre-lock"
+		_, err = kubeClientLeaderElection.CoordinationV1().Leases(getKyvernoNameSpace()).Create(ctx, &lease, v1.CreateOptions{})
+		if err != nil {
+			log.Log.Info("Failed to create lease 'kyvernopre-lock'")
+		}
+
+		log.Log.Info("Clean-up complete. Leader exiting...")
+
+		os.Exit(0)
 	}
 
-	// if there is any failure then we fail process
-	if failure {
-		log.Log.Info("failed to cleanup prior configurations")
+	le, err := leaderelection.New("kyvernopre", getKyvernoNameSpace(), kubeClientLeaderElection, run, nil, log.Log.WithName("kyvernopre/LeaderElection"))
+	if err != nil {
+		setupLog.Error(err, "failed to elect a leader")
 		os.Exit(1)
 	}
+
+	le.Run(ctx)
 }
 
 func executeRequest(client *client.Client, req request) error {
@@ -120,17 +233,6 @@ func executeRequest(client *client.Client, req request) error {
 	}
 
 	return nil
-}
-
-func createClientConfig(kubeconfig string) (*rest.Config, error) {
-	logger := log.Log
-	if kubeconfig == "" {
-		logger.Info("Using in-cluster configuration")
-		return rest.InClusterConfig()
-	}
-
-	logger.Info(fmt.Sprintf("Using configuration from '%s'", kubeconfig))
-	return clientcmd.BuildConfigFromFlags("", kubeconfig)
 }
 
 type request struct {
@@ -224,14 +326,14 @@ func merge(done <-chan struct{}, stopCh <-chan struct{}, processes ...<-chan err
 func removeClusterPolicyReport(client *client.Client, kind string) error {
 	logger := log.Log.WithName("removeClusterPolicyReport")
 
-	cpolrs, err := client.ListResource("", kind, "", nil)
+	cpolrs, err := client.ListResource("", kind, "", policyreport.LabelSelector)
 	if err != nil {
 		logger.Error(err, "failed to list clusterPolicyReport")
 		return nil
 	}
 
 	for _, cpolr := range cpolrs.Items {
-		deleteResource(client, cpolr.GetAPIVersion(), cpolr.GetKind(), "", cpolr.GetName(), nil)
+		deleteResource(client, cpolr.GetAPIVersion(), cpolr.GetKind(), "", cpolr.GetName())
 	}
 	return nil
 }
@@ -239,30 +341,49 @@ func removeClusterPolicyReport(client *client.Client, kind string) error {
 func removePolicyReport(client *client.Client, kind string) error {
 	logger := log.Log.WithName("removePolicyReport")
 
-	namespaces, err := client.ListResource("", "Namespace", "", nil)
+	polrs, err := client.ListResource("", kind, v1.NamespaceAll, policyreport.LabelSelector)
 	if err != nil {
-		logger.Error(err, "failed to list namespaces")
-		return err
+		logger.Error(err, "failed to list policyReport")
+		return nil
 	}
 
-	// name of namespace policy report follows the name convention
-	// pr-ns-<namespace name>
-	for _, ns := range namespaces.Items {
-		reportNames := []string{
-			fmt.Sprintf("policyreport-ns-%s", ns.GetName()),
-			fmt.Sprintf("pr-ns-%s", ns.GetName()),
-			fmt.Sprintf("polr-ns-%s", ns.GetName()),
-		}
-
-		var wg sync.WaitGroup
-		wg.Add(len(reportNames))
-		for _, reportName := range reportNames {
-			go deleteResource(client, "", kind, ns.GetName(), reportName, &wg)
-		}
-		wg.Wait()
+	for _, polr := range polrs.Items {
+		deleteResource(client, polr.GetAPIVersion(), polr.GetKind(), polr.GetNamespace(), polr.GetName())
 	}
 
 	return nil
+}
+
+func addClusterPolicyReportSelectorLabel(client *client.Client) {
+	logger := log.Log.WithName("addClusterPolicyReportSelectorLabel")
+
+	cpolrs, err := client.ListResource("", clusterPolicyReportKind, "", updateLabelSelector)
+	if err != nil {
+		logger.Error(err, "failed to list clusterPolicyReport")
+		return
+	}
+
+	for _, cpolr := range cpolrs.Items {
+		if cpolr.GetName() == policyreport.GeneratePolicyReportName("") {
+			addSelectorLabel(client, cpolr.GetAPIVersion(), cpolr.GetKind(), "", cpolr.GetName())
+		}
+	}
+}
+
+func addPolicyReportSelectorLabel(client *client.Client) {
+	logger := log.Log.WithName("addPolicyReportSelectorLabel")
+
+	polrs, err := client.ListResource("", policyReportKind, v1.NamespaceAll, updateLabelSelector)
+	if err != nil {
+		logger.Error(err, "failed to list policyReport")
+		return
+	}
+
+	for _, polr := range polrs.Items {
+		if polr.GetName() == policyreport.GeneratePolicyReportName(polr.GetNamespace()) {
+			addSelectorLabel(client, polr.GetAPIVersion(), polr.GetKind(), polr.GetNamespace(), polr.GetName())
+		}
+	}
 }
 
 func removeReportChangeRequest(client *client.Client, kind string) error {
@@ -276,7 +397,7 @@ func removeReportChangeRequest(client *client.Client, kind string) error {
 	}
 
 	for _, rcr := range rcrList.Items {
-		deleteResource(client, rcr.GetAPIVersion(), rcr.GetKind(), rcr.GetNamespace(), rcr.GetName(), nil)
+		deleteResource(client, rcr.GetAPIVersion(), rcr.GetKind(), rcr.GetNamespace(), rcr.GetName())
 	}
 
 	return nil
@@ -290,7 +411,7 @@ func removeClusterReportChangeRequest(client *client.Client, kind string) error 
 	}
 
 	for _, crcr := range crcrList.Items {
-		deleteResource(client, crcr.GetAPIVersion(), crcr.GetKind(), "", crcr.GetName(), nil)
+		deleteResource(client, crcr.GetAPIVersion(), crcr.GetKind(), "", crcr.GetName())
 	}
 	return nil
 }
@@ -319,11 +440,7 @@ func getKyvernoNameSpace() string {
 	return kyvernoNamespace
 }
 
-func deleteResource(client *client.Client, apiversion, kind, ns, name string, wg *sync.WaitGroup) {
-	if wg != nil {
-		defer wg.Done()
-	}
-
+func deleteResource(client *client.Client, apiversion, kind, ns, name string) {
 	err := client.DeleteResource(apiversion, kind, ns, name, false)
 	if err != nil && !errors.IsNotFound(err) {
 		log.Log.Error(err, "failed to delete resource", "kind", kind, "name", name)
@@ -331,4 +448,28 @@ func deleteResource(client *client.Client, apiversion, kind, ns, name string, wg
 	}
 
 	log.Log.Info("successfully cleaned up resource", "kind", kind, "name", name)
+}
+
+func addSelectorLabel(client *client.Client, apiversion, kind, ns, name string) {
+	res, err := client.GetResource(apiversion, kind, ns, name)
+	if err != nil && !errors.IsNotFound(err) {
+		log.Log.Error(err, "failed to get resource", "kind", kind, "name", name)
+		return
+	}
+
+	l, err := v1.LabelSelectorAsMap(policyreport.LabelSelector)
+	if err != nil {
+		log.Log.Error(err, "failed to convert labels", "labels", policyreport.LabelSelector)
+		return
+	}
+
+	res.SetLabels(labels.Merge(res.GetLabels(), l))
+
+	_, err = client.UpdateResource(apiversion, kind, ns, res, false)
+	if err != nil {
+		log.Log.Error(err, "failed to update resource", "kind", kind, "name", name)
+		return
+	}
+
+	log.Log.Info("successfully updated resource labels", "kind", kind, "name", name)
 }

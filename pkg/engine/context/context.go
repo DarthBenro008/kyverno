@@ -2,13 +2,14 @@ package context
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 	"sync"
 
+	"github.com/pkg/errors"
+
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	"k8s.io/api/admission/v1beta1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -53,34 +54,22 @@ type EvalInterface interface {
 
 //Context stores the data resources as JSON
 type Context struct {
-	mutex             sync.RWMutex
-	jsonRaw           []byte
-	jsonRawCheckpoint []byte
-	builtInVars       []string
-	images            *Images
-	log               logr.Logger
+	mutex              sync.RWMutex
+	jsonRaw            []byte
+	jsonRawCheckpoints [][]byte
+	images             *Images
+	log                logr.Logger
 }
 
 //NewContext returns a new context
-// builtInVars is the list of known variables (e.g. serviceAccountName)
-func NewContext(builtInVars ...string) *Context {
+func NewContext() *Context {
 	ctx := Context{
-		jsonRaw:     []byte(`{}`), // empty json struct
-		builtInVars: builtInVars,
-		log:         log.Log.WithName("context"),
+		jsonRaw:            []byte(`{}`), // empty json struct
+		log:                log.Log.WithName("context"),
+		jsonRawCheckpoints: make([][]byte, 0),
 	}
 
 	return &ctx
-}
-
-// InvalidVariableErr represents error for non-white-listed variables
-type InvalidVariableErr struct {
-	variable  string
-	whiteList []string
-}
-
-func (i InvalidVariableErr) Error() string {
-	return fmt.Sprintf("variable %s cannot be used, allowed variables: %v", i.variable, i.whiteList)
 }
 
 // AddJSON merges json data
@@ -88,14 +77,23 @@ func (ctx *Context) AddJSON(dataRaw []byte) error {
 	var err error
 	ctx.mutex.Lock()
 	defer ctx.mutex.Unlock()
-	// merge json
-	ctx.jsonRaw, err = jsonpatch.MergeMergePatches(ctx.jsonRaw, dataRaw)
 
+	ctx.jsonRaw, err = jsonpatch.MergeMergePatches(ctx.jsonRaw, dataRaw)
 	if err != nil {
-		ctx.log.Error(err, "failed to merge JSON data")
+		return errors.Wrap(err, "failed to merge JSON data")
+	}
+
+	return nil
+}
+
+// AddJSONObject merges json data
+func (ctx *Context) AddJSONObject(jsonData interface{}) error {
+	jsonBytes, err := json.Marshal(jsonData)
+	if err != nil {
 		return err
 	}
-	return nil
+
+	return ctx.AddJSON(jsonBytes)
 }
 
 // AddRequest adds an admission request to context
@@ -187,6 +185,7 @@ func (ctx *Context) AddResourceAsObject(data interface{}) error {
 		ctx.log.Error(err, "failed to marshal the resource")
 		return err
 	}
+
 	return ctx.AddJSON(objRaw)
 }
 
@@ -203,6 +202,7 @@ func (ctx *Context) AddUserInfo(userRequestInfo kyverno.RequestInfo) error {
 		ctx.log.Error(err, "failed to marshal the UserInfo")
 		return err
 	}
+	ctx.log.V(4).Info("Adding user info logs", "userRequestInfo", userRequestInfo)
 	return ctx.AddJSON(objRaw)
 }
 
@@ -251,7 +251,7 @@ func (ctx *Context) AddServiceAccount(userName string) error {
 	if err := ctx.AddJSON(saNsRaw); err != nil {
 		return err
 	}
-
+	ctx.log.V(4).Info("Adding service account", "service account name", saName, "service account namespace", saNamespace)
 	return nil
 }
 
@@ -277,12 +277,12 @@ func (ctx *Context) AddNamespace(namespace string) error {
 }
 
 func (ctx *Context) AddImageInfo(resource *unstructured.Unstructured) error {
-	initContainersImgs, containersImgs := extractImageInfo(resource, ctx.log)
-	if len(initContainersImgs) == 0 && len(containersImgs) == 0 {
+	initContainersImgs, containersImgs, ephemeralContainersImgs := extractImageInfo(resource, ctx.log)
+	if len(initContainersImgs) == 0 && len(containersImgs) == 0 && len(ephemeralContainersImgs) == 0 {
 		return nil
 	}
 
-	images := newImages(initContainersImgs, containersImgs)
+	images := newImages(initContainersImgs, containersImgs, ephemeralContainersImgs)
 	if images == nil {
 		return nil
 	}
@@ -306,43 +306,43 @@ func (ctx *Context) ImageInfo() *Images {
 	return ctx.images
 }
 
-// Checkpoint creates a copy of the internal state.
-// Prior checkpoints will be overridden.
+// Checkpoint creates a copy of the current internal state and
+// pushes it into a stack of stored states.
 func (ctx *Context) Checkpoint() {
 	ctx.mutex.Lock()
 	defer ctx.mutex.Unlock()
 
-	ctx.jsonRawCheckpoint = make([]byte, len(ctx.jsonRaw))
-	copy(ctx.jsonRawCheckpoint, ctx.jsonRaw)
+	jsonRawCheckpoint := make([]byte, len(ctx.jsonRaw))
+	copy(jsonRawCheckpoint, ctx.jsonRaw)
+
+	ctx.jsonRawCheckpoints = append(ctx.jsonRawCheckpoints, jsonRawCheckpoint)
 }
 
-// Restore restores internal state from a prior checkpoint, if one exists.
-// If a prior checkpoint does not exist, the state will not be changed.
+// Restore sets the internal state to the last checkpoint, and removes the checkpoint.
 func (ctx *Context) Restore() {
+	ctx.reset(true)
+}
+
+// Reset sets the internal state to the last checkpoint, but does not remove the checkpoint.
+func (ctx *Context) Reset() {
+	ctx.reset(false)
+}
+
+func (ctx *Context) reset(remove bool) {
 	ctx.mutex.Lock()
 	defer ctx.mutex.Unlock()
 
-	if ctx.jsonRawCheckpoint == nil || len(ctx.jsonRawCheckpoint) == 0 {
+	if len(ctx.jsonRawCheckpoints) == 0 {
 		return
 	}
 
-	ctx.jsonRaw = make([]byte, len(ctx.jsonRawCheckpoint))
-	copy(ctx.jsonRaw, ctx.jsonRawCheckpoint)
-}
+	n := len(ctx.jsonRawCheckpoints) - 1
+	jsonRawCheckpoint := ctx.jsonRawCheckpoints[n]
 
-// AddBuiltInVars adds given pattern to the builtInVars
-func (ctx *Context) AddBuiltInVars(pattern string) {
-	ctx.mutex.Lock()
-	defer ctx.mutex.Unlock()
+	ctx.jsonRaw = make([]byte, len(jsonRawCheckpoint))
+	copy(ctx.jsonRaw, jsonRawCheckpoint)
 
-	builtInVarsCopy := ctx.builtInVars
-	ctx.builtInVars = append(builtInVarsCopy, pattern)
-}
-
-func (ctx *Context) getBuiltInVars() []string {
-	ctx.mutex.RLock()
-	defer ctx.mutex.RUnlock()
-
-	vars := ctx.builtInVars
-	return vars
+	if remove {
+		ctx.jsonRawCheckpoints = ctx.jsonRawCheckpoints[:n]
+	}
 }

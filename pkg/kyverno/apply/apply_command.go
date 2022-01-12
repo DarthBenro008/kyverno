@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5/memfs"
-	pkgCommon "github.com/kyverno/kyverno/pkg/common"
 	client "github.com/kyverno/kyverno/pkg/dclient"
 	"github.com/kyverno/kyverno/pkg/kyverno/common"
 	sanitizederror "github.com/kyverno/kyverno/pkg/kyverno/sanitizedError"
@@ -35,6 +34,11 @@ type Policy struct {
 
 type Values struct {
 	Policies []Policy `json:"policies"`
+}
+
+type SkippedInvalidPolicies struct {
+	skipped []string
+	invalid []string
 }
 
 var applyHelp = `
@@ -118,12 +122,12 @@ func Command() *cobra.Command {
 				}
 			}()
 
-			rc, resources, skippedPolicies, pvInfos, err := applyCommandHelper(resourcePaths, cluster, policyReport, mutateLogPath, variablesString, valuesFile, namespace, policyPaths, stdin)
+			rc, resources, skipInvalidPolicies, pvInfos, err := applyCommandHelper(resourcePaths, cluster, policyReport, mutateLogPath, variablesString, valuesFile, namespace, policyPaths, stdin)
 			if err != nil {
 				return err
 			}
 
-			printReportOrViolation(policyReport, rc, resourcePaths, len(resources), skippedPolicies, stdin, pvInfos)
+			printReportOrViolation(policyReport, rc, resourcePaths, len(resources), skipInvalidPolicies, stdin, pvInfos)
 			return nil
 		},
 	}
@@ -141,47 +145,47 @@ func Command() *cobra.Command {
 }
 
 func applyCommandHelper(resourcePaths []string, cluster bool, policyReport bool, mutateLogPath string,
-	variablesString string, valuesFile string, namespace string, policyPaths []string, stdin bool) (rc *common.ResultCounts, resources []*unstructured.Unstructured, skippedPolicies []string, pvInfos []policyreport.Info, err error) {
+	variablesString string, valuesFile string, namespace string, policyPaths []string, stdin bool) (rc *common.ResultCounts, resources []*unstructured.Unstructured, skipInvalidPolicies SkippedInvalidPolicies, pvInfos []policyreport.Info, err error) {
 	store.SetMock(true)
 	kubernetesConfig := genericclioptions.NewConfigFlags(true)
 	fs := memfs.New()
 
 	if valuesFile != "" && variablesString != "" {
-		return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError("pass the values either using set flag or values_file flag", err)
+		return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("pass the values either using set flag or values_file flag", err)
 	}
 
 	variables, globalValMap, valuesMap, namespaceSelectorMap, err := common.GetVariable(variablesString, valuesFile, fs, false, "")
 
 	if err != nil {
 		if !sanitizederror.IsErrorSanitized(err) {
-			return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError("failed to decode yaml", err)
+			return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("failed to decode yaml", err)
 		}
-		return rc, resources, skippedPolicies, pvInfos, err
+		return rc, resources, skipInvalidPolicies, pvInfos, err
 	}
 
 	openAPIController, err := openapi.NewOpenAPIController()
 	if err != nil {
-		return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError("failed to initialize openAPIController", err)
+		return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("failed to initialize openAPIController", err)
 	}
 
 	var dClient *client.Client
 	if cluster {
 		restConfig, err := kubernetesConfig.ToRESTConfig()
 		if err != nil {
-			return rc, resources, skippedPolicies, pvInfos, err
+			return rc, resources, skipInvalidPolicies, pvInfos, err
 		}
 		dClient, err = client.NewClient(restConfig, 15*time.Minute, make(chan struct{}), log.Log)
 		if err != nil {
-			return rc, resources, skippedPolicies, pvInfos, err
+			return rc, resources, skipInvalidPolicies, pvInfos, err
 		}
 	}
 
 	if len(policyPaths) == 0 {
-		return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError(fmt.Sprintf("require policy"), err)
+		return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("require policy", err)
 	}
 
 	if (len(policyPaths) > 0 && policyPaths[0] == "-") && len(resourcePaths) > 0 && resourcePaths[0] == "-" {
-		return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError("a stdin pipe can be used for either policies or resources, not both", err)
+		return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("a stdin pipe can be used for either policies or resources, not both", err)
 	}
 
 	policies, err := common.GetPoliciesFromPaths(fs, policyPaths, false, "")
@@ -191,39 +195,42 @@ func applyCommandHelper(resourcePaths []string, cluster bool, policyReport bool,
 	}
 
 	if len(resourcePaths) == 0 && !cluster {
-		return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError(fmt.Sprintf("resource file(s) or cluster required"), err)
+		return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("resource file(s) or cluster required", err)
 	}
 
 	mutateLogPathIsDir, err := checkMutateLogPath(mutateLogPath)
 	if err != nil {
 		if !sanitizederror.IsErrorSanitized(err) {
-			return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError("failed to create file/folder", err)
+			return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("failed to create file/folder", err)
 		}
-		return rc, resources, skippedPolicies, pvInfos, err
+		return rc, resources, skipInvalidPolicies, pvInfos, err
 	}
 
 	// empty the previous contents of the file just in case if the file already existed before with some content(so as to perform overwrites)
 	// the truncation of files for the case when mutateLogPath is dir, is handled under pkg/kyverno/apply/common.go
 	if !mutateLogPathIsDir && mutateLogPath != "" {
-		_, err := os.OpenFile(mutateLogPath, os.O_TRUNC|os.O_WRONLY, 0644)
+		mutateLogPath = filepath.Clean(mutateLogPath)
+		// Necessary for us to include the file via variable as it is part of the CLI.
+		_, err := os.OpenFile(mutateLogPath, os.O_TRUNC|os.O_WRONLY, 0600) // #nosec G304
+
 		if err != nil {
 			if !sanitizederror.IsErrorSanitized(err) {
-				return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError("failed to truncate the existing file at "+mutateLogPath, err)
+				return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("failed to truncate the existing file at "+mutateLogPath, err)
 			}
-			return rc, resources, skippedPolicies, pvInfos, err
+			return rc, resources, skipInvalidPolicies, pvInfos, err
 		}
 	}
 
 	mutatedPolicies, err := common.MutatePolices(policies)
 	if err != nil {
 		if !sanitizederror.IsErrorSanitized(err) {
-			return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError("failed to mutate policy", err)
+			return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("failed to mutate policy", err)
 		}
 	}
 
 	err = common.PrintMutatedPolicy(mutatedPolicies)
 	if err != nil {
-		return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError("failed to marsal mutated policy", err)
+		return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("failed to marsal mutated policy", err)
 	}
 
 	resources, err = common.GetResourceAccordingToResourcePath(fs, resourcePaths, cluster, mutatedPolicies, dClient, namespace, policyReport, false, "")
@@ -233,7 +240,7 @@ func applyCommandHelper(resourcePaths []string, cluster bool, policyReport bool,
 	}
 
 	if (len(resources) > 1 || len(mutatedPolicies) > 1) && variablesString != "" {
-		return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError("currently `set` flag supports variable for single policy applied on single resource ", nil)
+		return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError("currently `set` flag supports variable for single policy applied on single resource ", nil)
 	}
 
 	if variablesString != "" {
@@ -257,22 +264,29 @@ func applyCommandHelper(resourcePaths []string, cluster bool, policyReport bool,
 	}
 
 	rc = &common.ResultCounts{}
-	skippedPolicies = make([]string, 0)
+	skipInvalidPolicies.skipped = make([]string, 0)
+	skipInvalidPolicies.invalid = make([]string, 0)
 
 	for _, policy := range mutatedPolicies {
 		err := policy2.Validate(policy, nil, true, openAPIController)
 		if err != nil {
-			skippedPolicies = append(skippedPolicies, policy.Name)
+			log.Log.Error(err, "policy validation error")
+			if strings.HasPrefix(err.Error(), "variable 'element.name'") {
+				skipInvalidPolicies.invalid = append(skipInvalidPolicies.invalid, policy.Name)
+			} else {
+				skipInvalidPolicies.skipped = append(skipInvalidPolicies.skipped, policy.Name)
+			}
+
 			continue
 		}
 
-		matches := common.PolicyHasVariables(*policy)
+		matches := common.HasVariables(policy)
 		variable := common.RemoveDuplicateAndObjectVariables(matches)
 		if len(variable) > 0 {
 			if len(variables) == 0 {
 				// check policy in variable file
 				if valuesFile == "" || valuesMap[policy.Name] == nil {
-					skippedPolicies = append(skippedPolicies, policy.Name)
+					skipInvalidPolicies.skipped = append(skipInvalidPolicies.skipped, policy.Name)
 					continue
 				}
 			}
@@ -283,19 +297,19 @@ func applyCommandHelper(resourcePaths []string, cluster bool, policyReport bool,
 		for _, resource := range resources {
 			thisPolicyResourceValues, err := common.CheckVariableForPolicy(valuesMap, globalValMap, policy.GetName(), resource.GetName(), resource.GetKind(), variables, kindOnwhichPolicyIsApplied, variable)
 			if err != nil {
-				return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError(fmt.Sprintf("policy `%s` have variables. pass the values for the variables for resource `%s` using set/values_file flag", policy.Name, resource.GetName()), err)
+				return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError(fmt.Sprintf("policy `%s` have variables. pass the values for the variables for resource `%s` using set/values_file flag", policy.Name, resource.GetName()), err)
 			}
 
-			_, info, err := common.ApplyPolicyOnResource(policy, resource, mutateLogPath, mutateLogPathIsDir, thisPolicyResourceValues, policyReport, namespaceSelectorMap, stdin, rc)
+			_, info, err := common.ApplyPolicyOnResource(policy, resource, mutateLogPath, mutateLogPathIsDir, thisPolicyResourceValues, policyReport, namespaceSelectorMap, stdin, rc, true)
 			if err != nil {
-				return rc, resources, skippedPolicies, pvInfos, sanitizederror.NewWithError(fmt.Errorf("failed to apply policy %v on resource %v", policy.Name, resource.GetName()).Error(), err)
+				return rc, resources, skipInvalidPolicies, pvInfos, sanitizederror.NewWithError(fmt.Errorf("failed to apply policy %v on resource %v", policy.Name, resource.GetName()).Error(), err)
 			}
 			pvInfos = append(pvInfos, info)
 
 		}
 	}
 
-	return rc, resources, skippedPolicies, pvInfos, nil
+	return rc, resources, skipInvalidPolicies, pvInfos, nil
 }
 
 // checkMutateLogPath - checking path for printing mutated resource (-o flag)
@@ -321,25 +335,38 @@ func checkMutateLogPath(mutateLogPath string) (mutateLogPathIsDir bool, err erro
 }
 
 // printReportOrViolation - printing policy report/violations
-func printReportOrViolation(policyReport bool, rc *common.ResultCounts, resourcePaths []string, resourcesLen int, skippedPolicies []string, stdin bool, pvInfos []policyreport.Info) {
-	if len(skippedPolicies) > 0 {
-		fmt.Println("----------------------------------------------------------------------\nPolicies Skipped(as required variables are not provided by the users):")
-		for i, policyName := range skippedPolicies {
-			fmt.Println(i+1, ". ", policyName)
+func printReportOrViolation(policyReport bool, rc *common.ResultCounts, resourcePaths []string, resourcesLen int, skipInvalidPolicies SkippedInvalidPolicies, stdin bool, pvInfos []policyreport.Info) {
+	divider := "----------------------------------------------------------------------"
+
+	if len(skipInvalidPolicies.skipped) > 0 {
+		fmt.Println(divider)
+		fmt.Println("Policies Skipped (as required variables are not provided by the user):")
+		for i, policyName := range skipInvalidPolicies.skipped {
+			fmt.Printf("%d. %s\n", i+1, policyName)
 		}
-		fmt.Println("----------------------------------------------------------------------")
+		fmt.Println(divider)
+	}
+	if len(skipInvalidPolicies.invalid) > 0 {
+		fmt.Println(divider)
+		fmt.Println("Invalid Policies:")
+		for i, policyName := range skipInvalidPolicies.invalid {
+			fmt.Printf("%d. %s\n", i+1, policyName)
+		}
+		fmt.Println(divider)
 	}
 
 	if policyReport {
-		os.Setenv("POLICY-TYPE", pkgCommon.PolicyReport)
 		resps := buildPolicyReports(pvInfos)
 		if len(resps) > 0 || resourcesLen == 0 {
-			fmt.Println("\n----------------------------------------------------------------------\nPOLICY REPORT:\n----------------------------------------------------------------------")
+			fmt.Println(divider)
+			fmt.Println("POLICY REPORT:")
+			fmt.Println(divider)
 			report, _ := generateCLIRaw(resps)
 			yamlReport, _ := yaml1.Marshal(report)
 			fmt.Println(string(yamlReport))
 		} else {
-			fmt.Println("----------------------------------------------------------------------\nPOLICY REPORT: skip generating policy report (no validate policy found/resource skipped)")
+			fmt.Println(divider)
+			fmt.Println("POLICY REPORT: skip generating policy report (no validate policy found/resource skipped)")
 		}
 	} else {
 		if !stdin {
@@ -369,32 +396,35 @@ func createFileOrFolder(mutateLogPath string, mutateLogPathIsDir bool) error {
 					folderPath = mutateLogPath[:len(mutateLogPath)-len(s[len(s)-1])-1]
 					_, err := os.Stat(folderPath)
 					if os.IsNotExist(err) {
-						errDir := os.MkdirAll(folderPath, 0755)
+						errDir := os.MkdirAll(folderPath, 0750)
 						if errDir != nil {
-							return sanitizederror.NewWithError(fmt.Sprintf("failed to create directory"), err)
+							return sanitizederror.NewWithError("failed to create directory", err)
 						}
 					}
 				}
 
-				file, err := os.OpenFile(mutateLogPath, os.O_RDONLY|os.O_CREATE, 0644)
+				mutateLogPath = filepath.Clean(mutateLogPath)
+				// Necessary for us to create the file via variable as it is part of the CLI.
+				file, err := os.OpenFile(mutateLogPath, os.O_RDONLY|os.O_CREATE, 0600) // #nosec G304
+
 				if err != nil {
-					return sanitizederror.NewWithError(fmt.Sprintf("failed to create file"), err)
+					return sanitizederror.NewWithError("failed to create file", err)
 				}
 
 				err = file.Close()
 				if err != nil {
-					return sanitizederror.NewWithError(fmt.Sprintf("failed to close file"), err)
+					return sanitizederror.NewWithError("failed to close file", err)
 				}
 
 			} else {
-				errDir := os.MkdirAll(mutateLogPath, 0755)
+				errDir := os.MkdirAll(mutateLogPath, 0750)
 				if errDir != nil {
-					return sanitizederror.NewWithError(fmt.Sprintf("failed to create directory"), err)
+					return sanitizederror.NewWithError("failed to create directory", err)
 				}
 			}
 
 		} else {
-			return sanitizederror.NewWithError(fmt.Sprintf("failed to describe file"), err)
+			return sanitizederror.NewWithError("failed to describe file", err)
 		}
 	}
 

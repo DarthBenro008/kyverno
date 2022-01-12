@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 
-	v1 "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	v1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -40,6 +40,12 @@ func GetPolicy(bytes []byte) (clusterPolicies []*v1.ClusterPolicy, err error) {
 			return nil, fmt.Errorf(msg)
 		}
 
+		if policy.Namespace != "" || (policy.Namespace == "" && policy.Kind == "Policy") {
+			if policy.Namespace == "" {
+				policy.Namespace = "default"
+			}
+			policy.Kind = "ClusterPolicy"
+		}
 		clusterPolicies = append(clusterPolicies, policy)
 	}
 

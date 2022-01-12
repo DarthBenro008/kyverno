@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 )
 
@@ -115,6 +115,6 @@ func Test_addResourceAndUserContext(t *testing.T) {
 	expectedResult = "nirmata"
 	t.Log(result)
 	if !reflect.DeepEqual(expectedResult, result) {
-		t.Error("exected result does not match")
+		t.Error("expected result does not match")
 	}
 }

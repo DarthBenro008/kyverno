@@ -11,7 +11,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/julienschmidt/httprouter"
-	v1 "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	v1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	kyvernoclient "github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	kyvernoinformer "github.com/kyverno/kyverno/pkg/client/informers/externalversions/kyverno/v1"
 	kyvernolister "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1"
@@ -31,12 +31,12 @@ import (
 	"github.com/kyverno/kyverno/pkg/policyreport"
 	"github.com/kyverno/kyverno/pkg/resourcecache"
 	tlsutils "github.com/kyverno/kyverno/pkg/tls"
-	userinfo "github.com/kyverno/kyverno/pkg/userinfo"
+	"github.com/kyverno/kyverno/pkg/userinfo"
 	"github.com/kyverno/kyverno/pkg/utils"
 	"github.com/kyverno/kyverno/pkg/webhookconfig"
 	webhookgenerate "github.com/kyverno/kyverno/pkg/webhooks/generate"
 	"github.com/pkg/errors"
-	v1beta1 "k8s.io/api/admission/v1beta1"
+	"k8s.io/api/admission/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	informers "k8s.io/client-go/informers/core/v1"
 	rbacinformer "k8s.io/client-go/informers/rbac/v1"
@@ -211,7 +211,7 @@ func NewWebhookServer(
 	mux.HandlerFunc("POST", config.PolicyValidatingWebhookServicePath, ws.handlerFunc(ws.policyValidation, true))
 	mux.HandlerFunc("POST", config.VerifyMutatingWebhookServicePath, ws.handlerFunc(ws.verifyHandler, false))
 
-	// Handle Liveness responds to a Kubernetes Liveness probe
+	// Patch Liveness responds to a Kubernetes Liveness probe
 	// Fail this request if Kubernetes should restart this instance
 	mux.HandlerFunc("GET", config.LivenessServicePath, func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -222,7 +222,7 @@ func NewWebhookServer(
 		}
 	})
 
-	// Handle Readiness responds to a Kubernetes Readiness probe
+	// Patch Readiness responds to a Kubernetes Readiness probe
 	// Fail this request if this instance can't accept traffic, but Kubernetes shouldn't restart it
 	mux.HandlerFunc("GET", config.ReadinessServicePath, func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -296,28 +296,39 @@ func (ws *WebhookServer) resourceMutation(request *v1beta1.AdmissionRequest) *v1
 		return successResponse(nil)
 	}
 
-	logger.V(4).Info("received an admission request in mutating webhook")
-	requestTime := time.Now().Unix()
+	if request.Operation == v1beta1.Delete {
+		resource, err := utils.ConvertResource(request.OldObject.Raw, request.Kind.Group, request.Kind.Version, request.Kind.Kind, request.Namespace)
 
-	mutatePolicies := ws.pCache.GetPolicies(policycache.Mutate, request.Kind.Kind, request.Namespace)
-	generatePolicies := ws.pCache.GetPolicies(policycache.Generate, request.Kind.Kind, request.Namespace)
-	verifyImagesPolicies := ws.pCache.GetPolicies(policycache.VerifyImages, request.Kind.Kind, request.Namespace)
-
-	if len(mutatePolicies) == 0 && len(generatePolicies) == 0 && len(verifyImagesPolicies) == 0 {
-		logger.V(4).Info("no policies matched admission request")
-		if request.Operation == v1beta1.Update {
-			// handle generate source resource updates
-			go ws.handleUpdatesForGenerateRules(request, []*v1.ClusterPolicy{})
+		if err == nil {
+			ws.prGenerator.Add(buildDeletionPrInfo(resource))
+		} else {
+			logger.Info(fmt.Sprintf("Converting oldObject failed: %v", err))
 		}
 
 		return successResponse(nil)
 	}
 
-	addRoles := containsRBACInfo(mutatePolicies, generatePolicies)
+	logger.V(4).Info("received an admission request in mutating webhook")
+	requestTime := time.Now().Unix()
+	kind := request.Kind.Kind
+	mutatePolicies := ws.pCache.GetPolicies(policycache.Mutate, kind, request.Namespace)
+	verifyImagesPolicies := ws.pCache.GetPolicies(policycache.VerifyImages, kind, request.Namespace)
+
+	if len(mutatePolicies) == 0 && len(verifyImagesPolicies) == 0 {
+		logger.V(4).Info("no policies matched admission request")
+		return successResponse(nil)
+	}
+
+	addRoles := containsRBACInfo(mutatePolicies)
 	policyContext, err := ws.buildPolicyContext(request, addRoles)
 	if err != nil {
 		logger.Error(err, "failed to build policy context")
 		return failureResponse(err.Error())
+	}
+
+	// update container images to a canonical form
+	if err := enginectx.MutateResourceWithImageInfo(request.Object.Raw, policyContext.JSONContext); err != nil {
+		ws.log.Error(err, "failed to patch images info to resource, policies that mutate images may be impacted")
 	}
 
 	mutatePatches := ws.applyMutatePolicies(request, policyContext, mutatePolicies, requestTime, logger)
@@ -328,9 +339,6 @@ func (ws *WebhookServer) resourceMutation(request *v1beta1.AdmissionRequest) *v1
 		logger.Error(err, "image verification failed")
 		return failureResponse(err.Error())
 	}
-
-	newRequest = patchRequest(imagePatches, newRequest, logger)
-	ws.applyGeneratePolicies(newRequest, policyContext, generatePolicies, requestTime, logger)
 
 	var patches = append(mutatePatches, imagePatches...)
 	return successResponse(patches)
@@ -350,11 +358,10 @@ func (ws *WebhookServer) buildPolicyContext(request *v1beta1.AdmissionRequest, a
 	}
 
 	if addRoles {
-		if roles, clusterRoles, err := userinfo.GetRoleRef(ws.rbLister, ws.crbLister, request, ws.configHandler); err != nil {
+		var err error
+		userRequestInfo.Roles, userRequestInfo.ClusterRoles, err = userinfo.GetRoleRef(ws.rbLister, ws.crbLister, request, ws.configHandler)
+		if err != nil {
 			return nil, errors.Wrap(err, "failed to fetch RBAC information for request")
-		} else {
-			userRequestInfo.Roles = roles
-			userRequestInfo.ClusterRoles = clusterRoles
 		}
 	}
 
@@ -371,10 +378,6 @@ func (ws *WebhookServer) buildPolicyContext(request *v1beta1.AdmissionRequest, a
 
 	if err := ctx.AddImageInfo(&resource); err != nil {
 		return nil, errors.Wrap(err, "failed to add image information to the policy rule context")
-	}
-
-	if err := enginectx.MutateResourceWithImageInfo(request.Object.Raw, ctx); err != nil {
-		ws.log.Error(err, "failed to patch images info to resource, policies that mutate images may be impacted")
 	}
 
 	policyContext := &engine.PolicyContext{
@@ -484,6 +487,7 @@ func registerAdmissionRequestsMetricGenerate(logger logr.Logger, promConfig metr
 
 func (ws *WebhookServer) resourceValidation(request *v1beta1.AdmissionRequest) *v1beta1.AdmissionResponse {
 	logger := ws.log.WithName("ValidateWebhook").WithValues("uid", request.UID, "kind", request.Kind.Kind, "namespace", request.Namespace, "name", request.Name, "operation", request.Operation)
+
 	if request.Operation == v1beta1.Delete {
 		ws.handleDelete(request)
 	}
@@ -495,14 +499,20 @@ func (ws *WebhookServer) resourceValidation(request *v1beta1.AdmissionRequest) *
 	logger.V(6).Info("received an admission request in validating webhook")
 	// timestamp at which this admission request got triggered
 	admissionRequestTimestamp := time.Now().Unix()
-
-	policies := ws.pCache.GetPolicies(policycache.ValidateEnforce, request.Kind.Kind, "")
+	kind := request.Kind.Kind
+	policies := ws.pCache.GetPolicies(policycache.ValidateEnforce, kind, "")
 	// Get namespace policies from the cache for the requested resource namespace
-	nsPolicies := ws.pCache.GetPolicies(policycache.ValidateEnforce, request.Kind.Kind, request.Namespace)
+	nsPolicies := ws.pCache.GetPolicies(policycache.ValidateEnforce, kind, request.Namespace)
 	policies = append(policies, nsPolicies...)
+	generatePolicies := ws.pCache.GetPolicies(policycache.Generate, kind, request.Namespace)
+
+	if len(generatePolicies) == 0 && request.Operation == v1beta1.Update {
+		// handle generate source resource updates
+		go ws.handleUpdatesForGenerateRules(request, []*v1.ClusterPolicy{})
+	}
 
 	var roles, clusterRoles []string
-	if containsRBACInfo(policies) {
+	if containsRBACInfo(policies, generatePolicies) {
 		var err error
 		roles, clusterRoles, err = userinfo.GetRoleRef(ws.rbLister, ws.crbLister, request, ws.configHandler)
 		if err != nil {
@@ -561,6 +571,9 @@ func (ws *WebhookServer) resourceValidation(request *v1beta1.AdmissionRequest) *
 	// push admission request to audit handler, this won't block the admission request
 	ws.auditHandler.Add(request.DeepCopy())
 
+	// process generate policies
+	ws.applyGeneratePolicies(request, policyContext, generatePolicies, admissionRequestTimestamp, logger)
+
 	return successResponse(nil)
 }
 
@@ -594,7 +607,10 @@ func (ws *WebhookServer) Stop(ctx context.Context) {
 	if err != nil {
 		// Error from closing listeners, or context timeout:
 		logger.Error(err, "shutting down server")
-		ws.server.Close()
+		err = ws.server.Close()
+		if err != nil {
+			logger.Error(err, "server shut down failed")
+		}
 	}
 }
 

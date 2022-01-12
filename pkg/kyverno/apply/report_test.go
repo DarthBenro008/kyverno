@@ -2,13 +2,10 @@ package apply
 
 import (
 	"encoding/json"
-	"os"
 	"testing"
 
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
-	preport "github.com/kyverno/kyverno/pkg/api/policyreport/v1alpha2"
-	report "github.com/kyverno/kyverno/pkg/api/policyreport/v1alpha2"
-	"github.com/kyverno/kyverno/pkg/common"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
+	preport "github.com/kyverno/kyverno/api/policyreport/v1alpha2"
 	"github.com/kyverno/kyverno/pkg/engine/response"
 	kyvCommon "github.com/kyverno/kyverno/pkg/kyverno/common"
 	"github.com/kyverno/kyverno/pkg/policyreport"
@@ -86,10 +83,9 @@ var rawPolicy = []byte(`
   }
 `)
 
-var rawEngRes = []byte(`{"PatchedResource":{"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx1","namespace":"default"},"spec":{"containers":[{"image":"nginx","imagePullPolicy":"IfNotPresent","name":"nginx","resources":{"limits":{"cpu":"200m","memory":"100Mi"},"requests":{"cpu":"100m","memory":"50Mi"}}}]}},"PolicyResponse":{"policy":{"name":"pod-requirements","namespace":""},"resource":{"kind":"Pod","apiVersion":"v1","namespace":"default","name":"nginx1","uid":""},"processingTime":974958,"rulesAppliedCount":2,"policyExecutionTimestamp":1630527712,"rules":[{"name":"pods-require-account","type":"Validation","message":"validation error: User pods must include an account for charging. Rule pods-require-account failed at path /metadata/labels/","success":false,"processingTime":28833,"ruleExecutionTimestamp":1630527712},{"name":"pods-require-limits","type":"Validation","message":"validation rule 'pods-require-limits' passed.","success":true,"processingTime":578625,"ruleExecutionTimestamp":1630527712}],"ValidationFailureAction":"audit"}}`)
+var rawEngRes = []byte(`{"PatchedResource":{"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx1","namespace":"default"},"spec":{"containers":[{"image":"nginx","imagePullPolicy":"IfNotPresent","name":"nginx","resources":{"limits":{"cpu":"200m","memory":"100Mi"},"requests":{"cpu":"100m","memory":"50Mi"}}}]}},"PolicyResponse":{"policy":{"name":"pod-requirements","namespace":""},"resource":{"kind":"Pod","apiVersion":"v1","namespace":"default","name":"nginx1","uid":""},"processingTime":974958,"rulesAppliedCount":2,"policyExecutionTimestamp":1630527712,"rules":[{"name":"pods-require-account","type":"Validation","message":"validation error: User pods must include an account for charging. Rule pods-require-account failed at path /metadata/labels/","status":"fail","processingTime":28833,"ruleExecutionTimestamp":1630527712},{"name":"pods-require-limits","type":"Validation","message":"validation rule 'pods-require-limits' passed.","status":"pass","processingTime":578625,"ruleExecutionTimestamp":1630527712}],"ValidationFailureAction":"audit"}}`)
 
 func Test_buildPolicyReports(t *testing.T) {
-	os.Setenv("POLICY-TYPE", common.PolicyReport)
 	rc := &kyvCommon.ResultCounts{}
 	var pvInfos []policyreport.Info
 	var policy kyverno.ClusterPolicy
@@ -118,15 +114,14 @@ func Test_buildPolicyReports(t *testing.T) {
 			assert.Assert(t, report.GetName() == "policyreport-ns-default")
 			assert.Assert(t, report.GetKind() == "PolicyReport")
 			assert.Assert(t, len(report.UnstructuredContent()["results"].([]interface{})) == 2)
-			assert.Assert(t,
-				report.UnstructuredContent()["summary"].(map[string]interface{})[preport.StatusPass].(int64) == 1,
-				report.UnstructuredContent()["summary"].(map[string]interface{})[preport.StatusPass].(int64))
+
+			summary := report.UnstructuredContent()["summary"].(map[string]interface{})
+			assert.Assert(t, summary[preport.StatusPass].(int64) == 1, summary[preport.StatusPass].(int64))
 		}
 	}
 }
 
 func Test_buildPolicyResults(t *testing.T) {
-	os.Setenv("POLICY-TYPE", common.PolicyReport)
 	rc := &kyvCommon.ResultCounts{}
 	var pvInfos []policyreport.Info
 	var policy kyverno.ClusterPolicy
@@ -147,29 +142,29 @@ func Test_buildPolicyResults(t *testing.T) {
 		for _, r := range result {
 			switch r.Rule {
 			case "pods-require-limits":
-				assert.Assert(t, r.Result == report.PolicyResult(preport.StatusPass))
+				assert.Assert(t, r.Result == preport.StatusPass)
 			case "pods-require-account":
-				assert.Assert(t, r.Result == report.PolicyResult(preport.StatusFail))
+				assert.Assert(t, r.Result == preport.StatusFail)
 			}
 		}
 	}
 }
 
 func Test_calculateSummary(t *testing.T) {
-	results := []*report.PolicyReportResult{
+	results := []*preport.PolicyReportResult{
 		{
 			Resources: make([]*v1.ObjectReference, 5),
-			Result:    report.PolicyResult(preport.StatusPass),
+			Result:    preport.PolicyResult(preport.StatusPass),
 		},
-		{Result: report.PolicyResult(preport.StatusFail)},
-		{Result: report.PolicyResult(preport.StatusFail)},
-		{Result: report.PolicyResult(preport.StatusFail)},
+		{Result: preport.PolicyResult(preport.StatusFail)},
+		{Result: preport.PolicyResult(preport.StatusFail)},
+		{Result: preport.PolicyResult(preport.StatusFail)},
 		{
 			Resources: make([]*v1.ObjectReference, 1),
-			Result:    report.PolicyResult(preport.StatusPass)},
+			Result:    preport.PolicyResult(preport.StatusPass)},
 		{
 			Resources: make([]*v1.ObjectReference, 4),
-			Result:    report.PolicyResult(preport.StatusPass),
+			Result:    preport.PolicyResult(preport.StatusPass),
 		},
 	}
 

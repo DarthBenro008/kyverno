@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/engine/context"
 )
 
@@ -28,13 +28,13 @@ type DurationOperatorHandler struct {
 // durationCompareByCondition compares a time.Duration key with a time.Duration value on the basis of the provided operator
 func durationCompareByCondition(key time.Duration, value time.Duration, op kyverno.ConditionOperator, log *logr.Logger) bool {
 	switch op {
-	case kyverno.DurationGreaterThanOrEquals:
+	case kyverno.ConditionOperators["DurationGreaterThanOrEquals"]:
 		return key >= value
-	case kyverno.DurationGreaterThan:
+	case kyverno.ConditionOperators["DurationGreaterThan"]:
 		return key > value
-	case kyverno.DurationLessThanOrEquals:
+	case kyverno.ConditionOperators["DurationLessThanOrEquals"]:
 		return key <= value
-	case kyverno.DurationLessThan:
+	case kyverno.ConditionOperators["DurationLessThan"]:
 		return key < value
 	default:
 		(*log).Info(fmt.Sprintf("Expected operator, one of [DurationGreaterThanOrEquals, DurationGreaterThan, DurationLessThanOrEquals, DurationLessThan], found %s", op))
@@ -71,7 +71,7 @@ func (doh DurationOperatorHandler) validateValueWithIntPattern(key int64, value 
 		if err == nil {
 			return durationCompareByCondition(time.Duration(key)*time.Second, duration, doh.condition, &doh.log)
 		}
-		doh.log.Error(fmt.Errorf("Parse Error: "), "Failed to parse time duration from the string value")
+		doh.log.Error(fmt.Errorf("parse error: "), "Failed to parse time duration from the string value")
 		return false
 	default:
 		doh.log.Info("Unexpected type", "value", value, "type", fmt.Sprintf("%T", value))
@@ -92,7 +92,7 @@ func (doh DurationOperatorHandler) validateValueWithFloatPattern(key float64, va
 		if err == nil {
 			return durationCompareByCondition(time.Duration(key)*time.Second, duration, doh.condition, &doh.log)
 		}
-		doh.log.Error(fmt.Errorf("Parse Error: "), "Failed to parse time duration from the string value")
+		doh.log.Error(fmt.Errorf("parse error: "), "Failed to parse time duration from the string value")
 		return false
 	default:
 		doh.log.Info("Unexpected type", "value", value, "type", fmt.Sprintf("%T", value))
@@ -118,7 +118,7 @@ func (doh DurationOperatorHandler) validateValueWithStringPattern(key string, va
 		if err == nil {
 			return durationCompareByCondition(duration, durationValue, doh.condition, &doh.log)
 		}
-		doh.log.Error(fmt.Errorf("Parse Error: "), "Failed to parse time duration from the string value")
+		doh.log.Error(fmt.Errorf("parse error: "), "Failed to parse time duration from the string value")
 		return false
 	default:
 		doh.log.Info("Unexpected type", "value", value, "type", fmt.Sprintf("%T", value))

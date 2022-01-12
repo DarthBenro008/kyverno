@@ -2,7 +2,6 @@ package policymutation
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -10,7 +9,7 @@ import (
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/common"
 	"github.com/kyverno/kyverno/pkg/engine"
 	"github.com/kyverno/kyverno/pkg/engine/variables"
@@ -38,6 +37,11 @@ func GenerateJSONPatchesForDefaults(policy *kyverno.ClusterPolicy, log logr.Logg
 		updateMsgs = append(updateMsgs, updateMsg)
 	}
 
+	if patch, updateMsg := defaultFailurePolicy(policy, log); patch != nil {
+		patches = append(patches, patch)
+		updateMsgs = append(updateMsgs, updateMsg)
+	}
+
 	patch, errs := GeneratePodControllerRule(*policy, log)
 	if len(errs) > 0 {
 		var errMsgs []string
@@ -49,17 +53,6 @@ func GenerateJSONPatchesForDefaults(policy *kyverno.ClusterPolicy, log logr.Logg
 	}
 	patches = append(patches, patch...)
 
-	convertPatch, errs := convertPatchToJSON6902(policy, log)
-	if len(errs) > 0 {
-		var errMsgs []string
-		for _, err := range errs {
-			errMsgs = append(errMsgs, err.Error())
-			log.Error(err, "failed to generate pod controller rule")
-		}
-		updateMsgs = append(updateMsgs, strings.Join(errMsgs, ";"))
-	}
-	patches = append(patches, convertPatch...)
-
 	formatedGVK, errs := checkForGVKFormatPatch(policy, log)
 	if len(errs) > 0 {
 		var errMsgs []string
@@ -70,17 +63,6 @@ func GenerateJSONPatchesForDefaults(policy *kyverno.ClusterPolicy, log logr.Logg
 		updateMsgs = append(updateMsgs, strings.Join(errMsgs, ";"))
 	}
 	patches = append(patches, formatedGVK...)
-
-	overlaySMPPatches, errs := convertOverlayToStrategicMerge(policy, log)
-	if len(errs) > 0 {
-		var errMsgs []string
-		for _, err := range errs {
-			errMsgs = append(errMsgs, err.Error())
-			log.Error(err, "failed to generate pod controller rule")
-		}
-		updateMsgs = append(updateMsgs, strings.Join(errMsgs, ";"))
-	}
-	patches = append(patches, overlaySMPPatches...)
 
 	return utils.JoinPatches(patches), updateMsgs
 }
@@ -174,82 +156,6 @@ func buildReplaceJsonPatch(path string, kindList []string) ([]byte, error) {
 	return json.Marshal(jsonPatch)
 }
 
-func convertPatchToJSON6902(policy *kyverno.ClusterPolicy, log logr.Logger) (patches [][]byte, errs []error) {
-	patches = make([][]byte, 0)
-
-	for i, rule := range policy.Spec.Rules {
-		if !reflect.DeepEqual(rule.Mutation, kyverno.Mutation{}) {
-			if len(rule.Mutation.Patches) > 0 {
-				mutation := rule.Mutation
-				patchesJSON6902 := ""
-				for _, patch := range mutation.Patches {
-					patchesJSON6902 += fmt.Sprintf("- path : %s\n  op : %s\n  value: %s\n", patch.Path, patch.Operation, patch.Value)
-				}
-				mutation.PatchesJSON6902 = patchesJSON6902
-				mutation.Patches = []kyverno.Patch{}
-
-				jsonPatch := struct {
-					Path  string            `json:"path"`
-					Op    string            `json:"op"`
-					Value *kyverno.Mutation `json:"value"`
-				}{
-					fmt.Sprintf("/spec/rules/%s/mutate", strconv.Itoa(i)),
-					"replace",
-					&mutation,
-				}
-
-				patchByte, err := json.Marshal(jsonPatch)
-				if err != nil {
-					errs = append(errs, fmt.Errorf("failed to convert patch to patchesJson6902 for policy '%s': %v", policy.Name, err))
-				}
-
-				patches = append(patches, patchByte)
-			}
-		}
-	}
-
-	return patches, errs
-}
-
-func convertOverlayToStrategicMerge(policy *kyverno.ClusterPolicy, log logr.Logger) (patches [][]byte, errs []error) {
-	patches = make([][]byte, 0)
-	if len(policy.Spec.Rules) == 0 {
-		return patches, []error{
-			errors.New("a policy should have at least one rule"),
-		}
-	}
-
-	for i, rule := range policy.Spec.Rules {
-		if !reflect.DeepEqual(rule.Mutation, kyverno.Mutation{}) {
-			if !reflect.DeepEqual(rule.Mutation.Overlay, kyverno.Mutation{}.Overlay) {
-				mutation := rule.Mutation
-				mutation.PatchStrategicMerge = mutation.Overlay
-				var a interface{}
-				mutation.Overlay = a
-
-				jsonPatch := struct {
-					Path  string            `json:"path"`
-					Op    string            `json:"op"`
-					Value *kyverno.Mutation `json:"value"`
-				}{
-					fmt.Sprintf("/spec/rules/%s/mutate", strconv.Itoa(i)),
-					"replace",
-					&mutation,
-				}
-
-				patchByte, err := json.Marshal(jsonPatch)
-				if err != nil {
-					errs = append(errs, fmt.Errorf("failed to convert overlay to patchStrategicMerge for policy '%s': %v", policy.Name, err))
-				}
-
-				patches = append(patches, patchByte)
-			}
-		}
-	}
-
-	return patches, errs
-}
-
 func defaultBackgroundFlag(policy *kyverno.ClusterPolicy, log logr.Logger) ([]byte, string) {
 	// set 'Background' flag to 'true' if not specified
 	defaultVal := true
@@ -303,6 +209,33 @@ func defaultvalidationFailureAction(policy *kyverno.ClusterPolicy, log logr.Logg
 		log.V(3).Info("generated JSON Patch to set default", "spec.validationFailureAction", Audit)
 
 		return patchByte, fmt.Sprintf("default 'ValidationFailureAction' to '%s'", Audit)
+	}
+
+	return nil, ""
+}
+func defaultFailurePolicy(policy *kyverno.ClusterPolicy, log logr.Logger) ([]byte, string) {
+	// set failurePolicy to Fail if not present
+	failurePolicy := string(kyverno.Fail)
+	if policy.Spec.FailurePolicy == nil {
+		log.V(4).Info("setting default value", "spec.failurePolicy", failurePolicy)
+		jsonPatch := struct {
+			Path  string `json:"path"`
+			Op    string `json:"op"`
+			Value string `json:"value"`
+		}{
+			"/spec/failurePolicy",
+			"add",
+			string(kyverno.Fail),
+		}
+
+		patchByte, err := json.Marshal(jsonPatch)
+		if err != nil {
+			log.Error(err, "failed to set default value", "spec.failurePolicy", failurePolicy)
+			return nil, ""
+		}
+
+		log.V(3).Info("generated JSON Patch to set default", "spec.failurePolicy", failurePolicy)
+		return patchByte, fmt.Sprintf("default failurePolicy to '%s'", failurePolicy)
 	}
 
 	return nil, ""
@@ -365,24 +298,69 @@ func CanAutoGen(policy *kyverno.ClusterPolicy, log logr.Logger) (applyAutoGen bo
 		match := rule.MatchResources
 		exclude := rule.ExcludeResources
 
-		if match.ResourceDescription.Name != "" || match.ResourceDescription.Selector != nil ||
-			exclude.ResourceDescription.Name != "" || exclude.ResourceDescription.Selector != nil {
+		if match.ResourceDescription.Name != "" || match.ResourceDescription.Selector != nil || match.ResourceDescription.Annotations != nil ||
+			exclude.ResourceDescription.Name != "" || exclude.ResourceDescription.Selector != nil || exclude.ResourceDescription.Annotations != nil {
 			log.V(3).Info("skip generating rule on pod controllers: Name / Selector in resource description may not be applicable.", "rule", rule.Name)
 			return false, "none"
 		}
 
-		if (len(match.Kinds) > 1 && utils.ContainsString(match.Kinds, "Pod")) ||
-			(len(exclude.Kinds) > 1 && utils.ContainsString(exclude.Kinds, "Pod")) {
+		if isKindOtherthanPod(match.Kinds) || isKindOtherthanPod(exclude.Kinds) {
 			return false, "none"
 		}
 
-		if rule.Mutation.Patches != nil || rule.Mutation.PatchesJSON6902 != "" ||
+		for _, value := range match.Any {
+			if isKindOtherthanPod(value.Kinds) {
+				return false, "none"
+			}
+			if value.Name != "" || value.Selector != nil || value.Annotations != nil {
+				log.V(3).Info("skip generating rule on pod controllers: Name / Selector in match any block is not be applicable.", "rule", rule.Name)
+				return false, "none"
+			}
+		}
+		for _, value := range match.All {
+
+			if isKindOtherthanPod(value.Kinds) {
+				return false, "none"
+			}
+			if value.Name != "" || value.Selector != nil || value.Annotations != nil {
+				log.V(3).Info("skip generating rule on pod controllers: Name / Selector in match all block is not be applicable.", "rule", rule.Name)
+				return false, "none"
+			}
+		}
+		for _, value := range exclude.Any {
+			if isKindOtherthanPod(value.Kinds) {
+				return false, "none"
+			}
+			if value.Name != "" || value.Selector != nil || value.Annotations != nil {
+				log.V(3).Info("skip generating rule on pod controllers: Name / Selector in exclude any block is not be applicable.", "rule", rule.Name)
+				return false, "none"
+			}
+		}
+		for _, value := range exclude.All {
+
+			if isKindOtherthanPod(value.Kinds) {
+				return false, "none"
+			}
+			if value.Name != "" || value.Selector != nil || value.Annotations != nil {
+				log.V(3).Info("skip generating rule on pod controllers: Name / Selector in exclud all block is not be applicable.", "rule", rule.Name)
+				return false, "none"
+			}
+		}
+
+		if rule.Mutation.PatchesJSON6902 != "" ||
 			rule.Validation.Deny != nil || rule.HasGenerate() {
 			return false, "none"
 		}
 	}
 
 	return true, engine.PodControllers
+}
+
+func isKindOtherthanPod(kinds []string) bool {
+	if len(kinds) > 1 && utils.ContainsPod(kinds, "Pod") {
+		return true
+	}
+	return false
 }
 
 func createRuleMap(rules []kyverno.Rule) map[string]kyvernoRule {
@@ -490,6 +468,7 @@ func generateRulePatches(policy kyverno.ClusterPolicy, controllers string, log l
 
 		// handle CronJob, it appends an additional rule
 		genRule = generateCronJobRule(rule, controllers, log)
+
 		if !reflect.DeepEqual(genRule, kyvernoRule{}) {
 			pbytes := convertToPatches(genRule, patchPostion)
 			pbytes = updateGenRuleByte(pbytes, "Cronjob", genRule)
@@ -503,7 +482,7 @@ func generateRulePatches(policy kyverno.ClusterPolicy, controllers string, log l
 }
 
 // the kyvernoRule holds the temporary kyverno rule struct
-// each field is a pointer to the the actual object
+// each field is a pointer to the actual object
 // when serializing data, we would expect to drop the omitempty key
 // otherwise (without the pointer), it will be set to empty value
 // - an empty struct in this case, some may fail the schema validation
@@ -534,22 +513,12 @@ func generateRuleForControllers(rule kyverno.Rule, controllers string, log logr.
 
 	match := rule.MatchResources
 	exclude := rule.ExcludeResources
-	matchResourceDescriptionsKinds := match.ResourceDescription.Kinds
-	for _, value := range match.All {
-		matchResourceDescriptionsKinds = append(matchResourceDescriptionsKinds, value.ResourceDescription.Kinds...)
-	}
-	for _, value := range match.Any {
-		matchResourceDescriptionsKinds = append(matchResourceDescriptionsKinds, value.ResourceDescription.Kinds...)
-	}
-	excludeResourceDescriptionsKinds := exclude.ResourceDescription.Kinds
-	for _, value := range exclude.All {
-		excludeResourceDescriptionsKinds = append(excludeResourceDescriptionsKinds, value.ResourceDescription.Kinds...)
-	}
-	for _, value := range exclude.Any {
-		excludeResourceDescriptionsKinds = append(excludeResourceDescriptionsKinds, value.ResourceDescription.Kinds...)
-	}
-	if !utils.ContainsString(matchResourceDescriptionsKinds, "Pod") ||
-		(len(excludeResourceDescriptionsKinds) != 0 && !utils.ContainsString(excludeResourceDescriptionsKinds, "Pod")) {
+
+	matchResourceDescriptionsKinds := rule.MatchKinds()
+	excludeResourceDescriptionsKinds := rule.ExcludeKinds()
+
+	if !utils.ContainsPod(matchResourceDescriptionsKinds, "Pod") ||
+		(len(excludeResourceDescriptionsKinds) != 0 && !utils.ContainsPod(excludeResourceDescriptionsKinds, "Pod")) {
 		return kyvernoRule{}
 	}
 
@@ -609,22 +578,26 @@ func generateRuleForControllers(rule kyverno.Rule, controllers string, log logr.
 	}
 
 	// overwrite Kinds by pod controllers defined in the annotation
-	controllerRule.MatchResources.Kinds = strings.Split(controllers, ",")
-	if len(exclude.Kinds) != 0 {
-		controllerRule.ExcludeResources.Kinds = strings.Split(controllers, ",")
+	if len(rule.MatchResources.Any) > 0 {
+		rule := getAnyAllAutogenRule(controllerRule.MatchResources.Any, controllers)
+		controllerRule.MatchResources.Any = rule
+	} else if len(rule.MatchResources.All) > 0 {
+		rule := getAnyAllAutogenRule(controllerRule.MatchResources.All, controllers)
+		controllerRule.MatchResources.All = rule
+	} else {
+		controllerRule.MatchResources.Kinds = strings.Split(controllers, ",")
 	}
 
-	if rule.Mutation.Overlay != nil {
-		newMutation := &kyverno.Mutation{
-			PatchStrategicMerge: map[string]interface{}{
-				"spec": map[string]interface{}{
-					"template": rule.Mutation.Overlay,
-				},
-			},
+	if len(rule.ExcludeResources.Any) > 0 {
+		rule := getAnyAllAutogenRule(controllerRule.ExcludeResources.Any, controllers)
+		controllerRule.ExcludeResources.Any = rule
+	} else if len(rule.ExcludeResources.All) > 0 {
+		rule := getAnyAllAutogenRule(controllerRule.ExcludeResources.All, controllers)
+		controllerRule.ExcludeResources.All = rule
+	} else {
+		if len(exclude.Kinds) != 0 {
+			controllerRule.ExcludeResources.Kinds = strings.Split(controllers, ",")
 		}
-
-		controllerRule.Mutation = newMutation.DeepCopy()
-		return *controllerRule
 	}
 
 	if rule.Mutation.PatchStrategicMerge != nil {
@@ -637,6 +610,25 @@ func generateRuleForControllers(rule kyverno.Rule, controllers string, log logr.
 		}
 
 		controllerRule.Mutation = newMutation.DeepCopy()
+		return *controllerRule
+	}
+
+	if len(rule.Mutation.ForEachMutation) > 0 && rule.Mutation.ForEachMutation != nil {
+		var newForeachMutation []*kyverno.ForEachMutation
+		for _, foreach := range rule.Mutation.ForEachMutation {
+			newForeachMutation = append(newForeachMutation, &kyverno.ForEachMutation{
+				List:             foreach.List,
+				AnyAllConditions: foreach.AnyAllConditions,
+				PatchStrategicMerge: map[string]interface{}{
+					"spec": map[string]interface{}{
+						"template": foreach.PatchStrategicMerge,
+					},
+				},
+			})
+		}
+		controllerRule.Mutation = &kyverno.Mutation{
+			ForEachMutation: newForeachMutation,
+		}
 		return *controllerRule
 	}
 
@@ -654,25 +646,28 @@ func generateRuleForControllers(rule kyverno.Rule, controllers string, log logr.
 	}
 
 	if rule.Validation.AnyPattern != nil {
-		var patterns []interface{}
+
 		anyPatterns, err := rule.Validation.DeserializeAnyPattern()
 		if err != nil {
 			logger.Error(err, "failed to deserialize anyPattern, expect type array")
 		}
 
-		for _, pattern := range anyPatterns {
-			newPattern := map[string]interface{}{
-				"spec": map[string]interface{}{
-					"template": pattern,
-				},
-			}
-
-			patterns = append(patterns, newPattern)
-		}
-
+		patterns := validateAnyPattern(anyPatterns)
 		controllerRule.Validation = &kyverno.Validation{
 			Message:    variables.FindAndShiftReferences(log, rule.Validation.Message, "spec/template", "anyPattern"),
 			AnyPattern: patterns,
+		}
+		return *controllerRule
+	}
+
+	if len(rule.Validation.ForEachValidation) > 0 && rule.Validation.ForEachValidation != nil {
+		newForeachValidate := make([]*kyverno.ForEachValidation, len(rule.Validation.ForEachValidation))
+		for i, foreach := range rule.Validation.ForEachValidation {
+			newForeachValidate[i] = foreach
+		}
+		controllerRule.Validation = &kyverno.Validation{
+			Message:           variables.FindAndShiftReferences(log, rule.Validation.Message, "spec/template", "pattern"),
+			ForEachValidation: newForeachValidate,
 		}
 		return *controllerRule
 	}
@@ -688,6 +683,31 @@ func generateRuleForControllers(rule kyverno.Rule, controllers string, log logr.
 	}
 
 	return kyvernoRule{}
+}
+
+func validateAnyPattern(anyPatterns []interface{}) []interface{} {
+	var patterns []interface{}
+	for _, pattern := range anyPatterns {
+		newPattern := map[string]interface{}{
+			"spec": map[string]interface{}{
+				"template": pattern,
+			},
+		}
+
+		patterns = append(patterns, newPattern)
+	}
+	return patterns
+}
+
+func getAnyAllAutogenRule(v kyverno.ResourceFilters, controllers string) kyverno.ResourceFilters {
+	anyKind := v.DeepCopy()
+
+	for i, value := range v {
+		if utils.ContainsPod(value.Kinds, "Pod") {
+			anyKind[i].Kinds = strings.Split(controllers, ",")
+		}
+	}
+	return anyKind
 }
 
 // defaultPodControllerAnnotation inserts an annotation

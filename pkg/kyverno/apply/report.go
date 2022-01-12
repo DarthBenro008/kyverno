@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	report "github.com/kyverno/kyverno/pkg/api/policyreport/v1alpha2"
+	report "github.com/kyverno/kyverno/api/policyreport/v1alpha2"
 	"github.com/kyverno/kyverno/pkg/engine/utils"
 	engineutils "github.com/kyverno/kyverno/pkg/engine/utils"
 	"github.com/kyverno/kyverno/pkg/policyreport"
@@ -108,7 +108,7 @@ func buildPolicyResults(infos []policyreport.Info) map[string][]*report.PolicyRe
 
 				result.Rule = rule.Name
 				result.Message = rule.Message
-				result.Result = report.PolicyResult(rule.Check)
+				result.Result = report.PolicyResult(rule.Status)
 				result.Source = policyreport.SourceValue
 				result.Timestamp = now
 				results[appname] = append(results[appname], &result)

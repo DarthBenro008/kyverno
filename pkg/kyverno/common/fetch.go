@@ -9,14 +9,14 @@ import (
 	"strings"
 
 	"github.com/go-git/go-billy/v5"
-	v1 "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	v1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	client "github.com/kyverno/kyverno/pkg/dclient"
 	engineutils "github.com/kyverno/kyverno/pkg/engine/utils"
 	"github.com/kyverno/kyverno/pkg/utils"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/scheme"
-	log "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
 )
 
@@ -220,8 +220,9 @@ func getFileBytes(path string) ([]byte, error) {
 		err  error
 	)
 
-	if IsHttpRegex.MatchString(path) {
-		resp, err := http.Get(path)
+	if IsHTTPRegex.MatchString(path) {
+		// We accept here that a random URL might be called based on user provided input.
+		resp, err := http.Get(path) // #nosec
 		if err != nil {
 			return nil, err
 		}
@@ -236,7 +237,9 @@ func getFileBytes(path string) ([]byte, error) {
 			return nil, err
 		}
 	} else {
-		file, err = ioutil.ReadFile(path)
+		path = filepath.Clean(path)
+		// We accept the risk of including a user provided file here.
+		file, err = ioutil.ReadFile(path) // #nosec G304
 		if err != nil {
 			return nil, err
 		}
@@ -273,6 +276,14 @@ func convertResourceToUnstructured(resourceYaml []byte) (*unstructured.Unstructu
 		resource.SetNamespace("default")
 	}
 	return resource, nil
+}
+
+// GetPatchedResource converts raw bytes to unstructured object
+func GetPatchedResource(patchResourceBytes []byte) (patchedResource unstructured.Unstructured, err error) {
+	getPatchedResource, err := GetResource(patchResourceBytes)
+	patchedResource = *getPatchedResource[0]
+
+	return patchedResource, nil
 }
 
 // getKindsFromPolicy will return the kinds from policy match block

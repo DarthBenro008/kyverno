@@ -3,7 +3,9 @@ package engine
 import (
 	"time"
 
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	"github.com/kyverno/kyverno/pkg/engine/common"
+
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/engine/response"
 	"github.com/kyverno/kyverno/pkg/engine/variables"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -75,14 +77,14 @@ func filterRule(rule kyverno.Rule, policyContext *PolicyContext) *response.RuleR
 	logger := log.Log.WithName("Generate").WithValues("policy", policy.Name,
 		"kind", newResource.GetKind(), "namespace", newResource.GetNamespace(), "name", newResource.GetName())
 
-	if err = MatchesResourceDescription(newResource, rule, admissionInfo, excludeGroupRole, namespaceLabels); err != nil {
+	if err = MatchesResourceDescription(newResource, rule, admissionInfo, excludeGroupRole, namespaceLabels, ""); err != nil {
 
 		// if the oldResource matched, return "false" to delete GR for it
-		if err = MatchesResourceDescription(oldResource, rule, admissionInfo, excludeGroupRole, namespaceLabels); err == nil {
+		if err = MatchesResourceDescription(oldResource, rule, admissionInfo, excludeGroupRole, namespaceLabels, ""); err == nil {
 			return &response.RuleResponse{
-				Name:    rule.Name,
-				Type:    "Generation",
-				Success: false,
+				Name:   rule.Name,
+				Type:   "Generation",
+				Status: response.RuleStatusFail,
 				RuleStats: response.RuleStats{
 					ProcessingTime:         time.Since(startTime),
 					RuleExecutionTimestamp: startTime.Unix(),
@@ -109,7 +111,7 @@ func filterRule(rule kyverno.Rule, policyContext *PolicyContext) *response.RuleR
 	}
 
 	// operate on the copy of the conditions, as we perform variable substitution
-	copyConditions, err := transformConditions(ruleCopy.AnyAllConditions)
+	copyConditions, err := common.TransformConditions(ruleCopy.AnyAllConditions)
 	if err != nil {
 		logger.V(4).Info("cannot copy AnyAllConditions", "reason", err.Error())
 		return nil
@@ -117,15 +119,15 @@ func filterRule(rule kyverno.Rule, policyContext *PolicyContext) *response.RuleR
 
 	// evaluate pre-conditions
 	if !variables.EvaluateConditions(logger, ctx, copyConditions) {
-		logger.V(4).Info("preconditions not satisfied, skipping rule", "rule", ruleCopy.Name)
+		logger.V(4).Info("skip rule as preconditions are not met", "rule", ruleCopy.Name)
 		return nil
 	}
 
 	// build rule Response
 	return &response.RuleResponse{
-		Name:    ruleCopy.Name,
-		Type:    "Generation",
-		Success: true,
+		Name:   ruleCopy.Name,
+		Type:   "Generation",
+		Status: response.RuleStatusPass,
 		RuleStats: response.RuleStats{
 			ProcessingTime:         time.Since(startTime),
 			RuleExecutionTimestamp: startTime.Unix(),

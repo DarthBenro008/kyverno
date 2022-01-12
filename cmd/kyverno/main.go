@@ -5,12 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof"
+
+	// We currently accept the risk of exposing pprof and rely on users to protect the endpoint.
+	_ "net/http/pprof" // #nosec
 	"os"
 	"strings"
 	"time"
-
-	"github.com/kyverno/kyverno/pkg/cosign"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	kubeinformers "k8s.io/client-go/informers"
@@ -18,11 +18,12 @@ import (
 	"k8s.io/klog/v2/klogr"
 	log "sigs.k8s.io/controller-runtime/pkg/log"
 
-	backwardcompatibility "github.com/kyverno/kyverno/pkg/backward_compatibility"
 	kyvernoclient "github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	kyvernoinformer "github.com/kyverno/kyverno/pkg/client/informers/externalversions"
 	"github.com/kyverno/kyverno/pkg/common"
+	backwardcompatibility "github.com/kyverno/kyverno/pkg/compatibility"
 	"github.com/kyverno/kyverno/pkg/config"
+	"github.com/kyverno/kyverno/pkg/cosign"
 	dclient "github.com/kyverno/kyverno/pkg/dclient"
 	event "github.com/kyverno/kyverno/pkg/event"
 	"github.com/kyverno/kyverno/pkg/generate"
@@ -59,9 +60,12 @@ var (
 	genWorkers                   int
 	profile                      bool
 	disableMetricsExport         bool
+	autoUpdateWebhooks           bool
 	policyControllerResyncPeriod time.Duration
 	imagePullSecrets             string
 	imageSignatureRepository     string
+	clientRateLimitQPS           float64
+	clientRateLimitBurst         int
 	setupLog                     = log.Log.WithName("setup")
 )
 
@@ -71,17 +75,31 @@ func main() {
 	flag.StringVar(&filterK8sResources, "filterK8sResources", "", "Resource in format [kind,namespace,name] where policy is not evaluated by the admission webhook. For example, --filterK8sResources \"[Deployment, kyverno, kyverno],[Events, *, *]\"")
 	flag.StringVar(&excludeGroupRole, "excludeGroupRole", "", "")
 	flag.StringVar(&excludeUsername, "excludeUsername", "", "")
-	flag.IntVar(&webhookTimeout, "webhooktimeout", 3, "Timeout for webhook configurations")
-	flag.IntVar(&genWorkers, "gen-workers", 10, "Workers for generate controller")
+	flag.IntVar(&webhookTimeout, "webhooktimeout", int(webhookconfig.DefaultWebhookTimeout), "Timeout for webhook configurations. Deprecated and will be removed in 1.6.0.")
+	flag.IntVar(&webhookTimeout, "webhookTimeout", int(webhookconfig.DefaultWebhookTimeout), "Timeout for webhook configurations.")
+	// deprecated
+	flag.IntVar(&genWorkers, "gen-workers", 10, "Workers for generate controller. Deprecated and will be removed in 1.6.0. ")
+	flag.IntVar(&genWorkers, "genWorkers", 10, "Workers for generate controller")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&serverIP, "serverIP", "", "IP address where Kyverno controller runs. Only required if out-of-cluster.")
 	flag.BoolVar(&profile, "profile", false, "Set this flag to 'true', to enable profiling.")
-	flag.StringVar(&profilePort, "profile-port", "6060", "Enable profiling at given port, defaults to 6060.")
-	flag.BoolVar(&disableMetricsExport, "disable-metrics", false, "Set this flag to 'true', to enable exposing the metrics.")
-	flag.StringVar(&metricsPort, "metrics-port", "8000", "Expose prometheus metrics at the given port, default to 8000.")
-	flag.DurationVar(&policyControllerResyncPeriod, "background-scan", time.Hour, "Perform background scan every given interval, e.g., 30s, 15m, 1h.")
+	// deprecated
+	flag.StringVar(&profilePort, "profile-port", "6060", "Enable profiling at given port, defaults to 6060. Deprecated and will be removed in 1.6.0. ")
+	flag.StringVar(&profilePort, "profilePort", "6060", "Enable profiling at given port, defaults to 6060.")
+	// deprecated
+	flag.BoolVar(&disableMetricsExport, "disable-metrics", false, "Set this flag to 'true', to enable exposing the metrics. Deprecated and will be removed in 1.6.0. ")
+	flag.BoolVar(&disableMetricsExport, "disableMetrics", false, "Set this flag to 'true', to enable exposing the metrics.")
+	// deprecated
+	flag.StringVar(&metricsPort, "metrics-port", "8000", "Expose prometheus metrics at the given port, default to 8000. Deprecated and will be removed in 1.6.0. ")
+	flag.StringVar(&metricsPort, "metricsPort", "8000", "Expose prometheus metrics at the given port, default to 8000.")
+	// deprecated
+	flag.DurationVar(&policyControllerResyncPeriod, "background-scan", time.Hour, "Perform background scan every given interval, e.g., 30s, 15m, 1h. Deprecated and will be removed in 1.6.0. ")
+	flag.DurationVar(&policyControllerResyncPeriod, "backgroundScan", time.Hour, "Perform background scan every given interval, e.g., 30s, 15m, 1h.")
 	flag.StringVar(&imagePullSecrets, "imagePullSecrets", "", "Secret resource names for image registry access credentials.")
 	flag.StringVar(&imageSignatureRepository, "imageSignatureRepository", "", "Alternate repository for image signatures. Can be overridden per rule via `verifyImages.Repository`.")
+	flag.BoolVar(&autoUpdateWebhooks, "autoUpdateWebhooks", true, "Set this flag to 'false' to disable auto-configuration of the webhook.")
+	flag.Float64Var(&clientRateLimitQPS, "clientRateLimitQPS", 0, "Configure the maximum QPS to the master from Kyverno. Uses the client default if zero.")
+	flag.IntVar(&clientRateLimitBurst, "clientRateLimitBurst", 0, "Configure the maximum burst for throttle. Uses the client default if zero.")
 
 	if err := flag.Set("v", "2"); err != nil {
 		setupLog.Error(err, "failed to set log level")
@@ -93,22 +111,20 @@ func main() {
 	version.PrintVersionInfo(log.Log)
 	cleanUp := make(chan struct{})
 	stopCh := signal.SetupSignalHandler()
-	clientConfig, err := config.CreateClientConfig(kubeconfig, log.Log)
+	clientConfig, err := config.CreateClientConfig(kubeconfig, clientRateLimitQPS, clientRateLimitBurst, log.Log)
 	if err != nil {
 		setupLog.Error(err, "Failed to build kubeconfig")
 		os.Exit(1)
 	}
 
-	var profilingServerMux *http.ServeMux
 	var metricsServerMux *http.ServeMux
 	var promConfig *metrics.PromConfig
 
 	if profile {
-		profilingServerMux = http.NewServeMux()
 		addr := ":" + profilePort
 		setupLog.Info("Enable profiling, see details at https://github.com/kyverno/kyverno/wiki/Profiling-Kyverno-on-Kubernetes", "port", profilePort)
 		go func() {
-			if err := http.ListenAndServe(addr, profilingServerMux); err != nil {
+			if err := http.ListenAndServe(addr, nil); err != nil {
 				setupLog.Error(err, "Failed to enable profiling")
 				os.Exit(1)
 			}
@@ -198,7 +214,6 @@ func main() {
 	)
 
 	prgen, err := policyreport.NewReportGenerator(
-		kubeClient,
 		pclient,
 		client,
 		pInformer.Wgpolicyk8s().V1alpha2().ClusterPolicyReports(),
@@ -218,10 +233,15 @@ func main() {
 	webhookCfg := webhookconfig.NewRegister(
 		clientConfig,
 		client,
+		pclient,
 		rCache,
+		pInformer.Kyverno().V1().ClusterPolicies(),
+		pInformer.Kyverno().V1().Policies(),
 		serverIP,
 		int32(webhookTimeout),
 		debug,
+		autoUpdateWebhooks,
+		stopCh,
 		log.Log)
 
 	webhookMonitor, err := webhookconfig.NewMonitor(kubeClient, log.Log.WithName("WebhookMonitor"))
@@ -381,7 +401,9 @@ func main() {
 			os.Exit(1)
 		}
 
-		go webhookCfg.UpdateWebhookConfigurations(configData)
+		if !autoUpdateWebhooks {
+			go webhookCfg.UpdateWebhookConfigurations(configData)
+		}
 		if registrationErr := registerWrapperRetry(); registrationErr != nil {
 			setupLog.Error(err, "Timeout registering admission control webhooks")
 			os.Exit(1)

@@ -1,11 +1,15 @@
 package webhookconfig
 
 import (
+	"errors"
 	"io/ioutil"
+	"path/filepath"
+	"reflect"
+	"strings"
 
 	"github.com/kyverno/kyverno/pkg/config"
 	"github.com/kyverno/kyverno/pkg/tls"
-	admregapi "k8s.io/api/admissionregistration/v1beta1"
+	admregapi "k8s.io/api/admissionregistration/v1"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -41,7 +45,9 @@ func extractCA(config *rest.Config) (result []byte) {
 	fileName := config.TLSClientConfig.CAFile
 
 	if fileName != "" {
-		result, err := ioutil.ReadFile(fileName)
+		fileName = filepath.Clean(fileName)
+		// We accept the risk of including a user provided file here.
+		result, err := ioutil.ReadFile(fileName) // #nosec G304
 
 		if err != nil {
 			return nil
@@ -56,27 +62,31 @@ func extractCA(config *rest.Config) (result []byte) {
 func (wrc *Register) constructOwner() v1.OwnerReference {
 	logger := wrc.log
 
-	kubeNamespace, err := wrc.GetKubePolicyNamespace()
+	kubeClusterRoleName, err := wrc.GetKubePolicyClusterRoleName()
 	if err != nil {
-		logger.Error(err, "failed to construct OwnerReference")
+		logger.Error(err, "failed to get cluster role")
 		return v1.OwnerReference{}
 	}
 
 	return v1.OwnerReference{
-		APIVersion: config.NamespaceAPIVersion,
-		Kind:       config.NamespaceKind,
-		Name:       config.KyvernoNamespace,
-		UID:        kubeNamespace.GetUID(),
+		APIVersion: config.ClusterRoleAPIVersion,
+		Kind:       config.ClusterRoleKind,
+		Name:       kubeClusterRoleName.GetName(),
+		UID:        kubeClusterRoleName.GetUID(),
 	}
 }
 
-func (wrc *Register) GetKubePolicyNamespace() (*unstructured.Unstructured, error) {
-	kubeNamespace, err := wrc.client.GetResource(config.NamespaceAPIVersion, config.NamespaceKind, "", config.KyvernoNamespace)
+func (wrc *Register) GetKubePolicyClusterRoleName() (*unstructured.Unstructured, error) {
+	clusterRoles, err := wrc.client.ListResource(config.ClusterRoleAPIVersion, config.ClusterRoleKind, "", &v1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "kyverno"}})
 	if err != nil {
 		return nil, err
 	}
-
-	return kubeNamespace, nil
+	for _, cr := range clusterRoles.Items {
+		if strings.HasSuffix(cr.GetName(), "webhook") {
+			return &cr, nil
+		}
+	}
+	return nil, errors.New("failed to get cluster role with suffix webhook")
 }
 
 // GetKubePolicyDeployment gets Kyverno deployment using the resource cache
@@ -95,76 +105,66 @@ func (wrc *Register) GetKubePolicyDeployment() (*apps.Deployment, *unstructured.
 }
 
 // debug mutating webhook
-func generateDebugMutatingWebhook(name, url string, caData []byte, validate bool, timeoutSeconds int32, resources []string, apiGroups, apiVersions string, operationTypes []admregapi.OperationType) admregapi.MutatingWebhook {
+func generateDebugMutatingWebhook(name, url string, caData []byte, validate bool, timeoutSeconds int32, rule admregapi.Rule, operationTypes []admregapi.OperationType, failurePolicy admregapi.FailurePolicyType) admregapi.MutatingWebhook {
 	sideEffect := admregapi.SideEffectClassNoneOnDryRun
-	failurePolicy := admregapi.Ignore
 	reinvocationPolicy := admregapi.NeverReinvocationPolicy
 
-	return admregapi.MutatingWebhook{
+	w := admregapi.MutatingWebhook{
 		ReinvocationPolicy: &reinvocationPolicy,
 		Name:               name,
 		ClientConfig: admregapi.WebhookClientConfig{
 			URL:      &url,
 			CABundle: caData,
 		},
-		SideEffects: &sideEffect,
-		Rules: []admregapi.RuleWithOperations{
-			{
-				Operations: operationTypes,
-				Rule: admregapi.Rule{
-					APIGroups: []string{
-						apiGroups,
-					},
-					APIVersions: []string{
-						apiVersions,
-					},
-					Resources: resources,
-				},
-			},
-		},
+		SideEffects:             &sideEffect,
 		AdmissionReviewVersions: []string{"v1beta1"},
 		TimeoutSeconds:          &timeoutSeconds,
 		FailurePolicy:           &failurePolicy,
 	}
+
+	if !reflect.DeepEqual(rule, admregapi.Rule{}) {
+		w.Rules = []admregapi.RuleWithOperations{
+			{
+				Operations: operationTypes,
+				Rule:       rule,
+			},
+		}
+	}
+
+	return w
 }
 
-func generateDebugValidatingWebhook(name, url string, caData []byte, validate bool, timeoutSeconds int32, resources []string, apiGroups, apiVersions string, operationTypes []admregapi.OperationType) admregapi.ValidatingWebhook {
+func generateDebugValidatingWebhook(name, url string, caData []byte, validate bool, timeoutSeconds int32, rule admregapi.Rule, operationTypes []admregapi.OperationType, failurePolicy admregapi.FailurePolicyType) admregapi.ValidatingWebhook {
 	sideEffect := admregapi.SideEffectClassNoneOnDryRun
-	failurePolicy := admregapi.Ignore
-	return admregapi.ValidatingWebhook{
+	w := admregapi.ValidatingWebhook{
 		Name: name,
 		ClientConfig: admregapi.WebhookClientConfig{
 			URL:      &url,
 			CABundle: caData,
 		},
-		SideEffects: &sideEffect,
-		Rules: []admregapi.RuleWithOperations{
-			{
-				Operations: operationTypes,
-				Rule: admregapi.Rule{
-					APIGroups: []string{
-						apiGroups,
-					},
-					APIVersions: []string{
-						apiVersions,
-					},
-					Resources: resources,
-				},
-			},
-		},
+		SideEffects:             &sideEffect,
 		AdmissionReviewVersions: []string{"v1beta1"},
 		TimeoutSeconds:          &timeoutSeconds,
 		FailurePolicy:           &failurePolicy,
 	}
+
+	if !reflect.DeepEqual(rule, admregapi.Rule{}) {
+		w.Rules = []admregapi.RuleWithOperations{
+			{
+				Operations: operationTypes,
+				Rule:       rule,
+			},
+		}
+	}
+	return w
 }
 
 // mutating webhook
-func generateMutatingWebhook(name, servicePath string, caData []byte, validation bool, timeoutSeconds int32, resources []string, apiGroups, apiVersions string, operationTypes []admregapi.OperationType) admregapi.MutatingWebhook {
+func generateMutatingWebhook(name, servicePath string, caData []byte, validation bool, timeoutSeconds int32, rule admregapi.Rule, operationTypes []admregapi.OperationType, failurePolicy admregapi.FailurePolicyType) admregapi.MutatingWebhook {
 	sideEffect := admregapi.SideEffectClassNoneOnDryRun
-	failurePolicy := admregapi.Ignore
-	reinvocationPolicy := admregapi.NeverReinvocationPolicy
+	reinvocationPolicy := admregapi.IfNeededReinvocationPolicy
 
-	return admregapi.MutatingWebhook{
+	w := admregapi.MutatingWebhook{
 		ReinvocationPolicy: &reinvocationPolicy,
 		Name:               name,
 		ClientConfig: admregapi.WebhookClientConfig{
@@ -175,32 +175,27 @@ func generateMutatingWebhook(name, servicePath string, caData []byte, validation
 			},
 			CABundle: caData,
 		},
-		SideEffects: &sideEffect,
-		Rules: []admregapi.RuleWithOperations{
-			{
-				Operations: operationTypes,
-				Rule: admregapi.Rule{
-					APIGroups: []string{
-						apiGroups,
-					},
-					APIVersions: []string{
-						apiVersions,
-					},
-					Resources: resources,
-				},
-			},
-		},
+		SideEffects:             &sideEffect,
 		AdmissionReviewVersions: []string{"v1beta1"},
 		TimeoutSeconds:          &timeoutSeconds,
 		FailurePolicy:           &failurePolicy,
 	}
+
+	if !reflect.DeepEqual(rule, admregapi.Rule{}) {
+		w.Rules = []admregapi.RuleWithOperations{
+			{
+				Operations: operationTypes,
+				Rule:       rule,
+			},
+		}
+	}
+	return w
 }
 
 // validating webhook
-func generateValidatingWebhook(name, servicePath string, caData []byte, validation bool, timeoutSeconds int32, resources []string, apiGroups, apiVersions string, operationTypes []admregapi.OperationType) admregapi.ValidatingWebhook {
+func generateValidatingWebhook(name, servicePath string, caData []byte, validation bool, timeoutSeconds int32, rule admregapi.Rule, operationTypes []admregapi.OperationType, failurePolicy admregapi.FailurePolicyType) admregapi.ValidatingWebhook {
 	sideEffect := admregapi.SideEffectClassNoneOnDryRun
-	failurePolicy := admregapi.Ignore
-	return admregapi.ValidatingWebhook{
+	w := admregapi.ValidatingWebhook{
 		Name: name,
 		ClientConfig: admregapi.WebhookClientConfig{
 			Service: &admregapi.ServiceReference{
@@ -210,23 +205,19 @@ func generateValidatingWebhook(name, servicePath string, caData []byte, validati
 			},
 			CABundle: caData,
 		},
-		SideEffects: &sideEffect,
-		Rules: []admregapi.RuleWithOperations{
-			{
-				Operations: operationTypes,
-				Rule: admregapi.Rule{
-					APIGroups: []string{
-						apiGroups,
-					},
-					APIVersions: []string{
-						apiVersions,
-					},
-					Resources: resources,
-				},
-			},
-		},
+		SideEffects:             &sideEffect,
 		AdmissionReviewVersions: []string{"v1beta1"},
 		TimeoutSeconds:          &timeoutSeconds,
 		FailurePolicy:           &failurePolicy,
 	}
+
+	if !reflect.DeepEqual(rule, admregapi.Rule{}) {
+		w.Rules = []admregapi.RuleWithOperations{
+			{
+				Operations: operationTypes,
+				Rule:       rule,
+			},
+		}
+	}
+	return w
 }

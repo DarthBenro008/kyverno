@@ -1,23 +1,25 @@
 package policyreport
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"time"
 
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
-	request "github.com/kyverno/kyverno/pkg/api/kyverno/v1alpha2"
-	report "github.com/kyverno/kyverno/pkg/api/policyreport/v1alpha2"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
+	request "github.com/kyverno/kyverno/api/kyverno/v1alpha2"
+	report "github.com/kyverno/kyverno/api/policyreport/v1alpha2"
 	kyvernolister "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/config"
+	"github.com/kyverno/kyverno/pkg/engine"
 	"github.com/kyverno/kyverno/pkg/engine/response"
 	"github.com/kyverno/kyverno/pkg/engine/utils"
 	"github.com/kyverno/kyverno/pkg/version"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -35,11 +37,11 @@ const (
 	deletedAnnotationResourceName string = "kyverno.io/delete.resource.name"
 	deletedAnnotationResourceKind string = "kyverno.io/delete.resource.kind"
 
-	// static value for PolicyReportResult.Source
+	// SourceValue is the static value for PolicyReportResult.Source
 	SourceValue = "Kyverno"
 )
 
-func generatePolicyReportName(ns string) string {
+func GeneratePolicyReportName(ns string) string {
 	if ns == "" {
 		return clusterpolicyreport
 	}
@@ -62,6 +64,10 @@ func GeneratePRsFromEngineResponse(ers []*response.EngineResponse, log logr.Logg
 		}
 
 		if len(er.PolicyResponse.Rules) == 0 {
+			continue
+		}
+
+		if er.Policy != nil && engine.ManagedPodResource(*er.Policy, er.PatchedResource) {
 			continue
 		}
 
@@ -90,9 +96,10 @@ func NewBuilder(cpolLister kyvernolister.ClusterPolicyLister, polLister kyvernol
 
 func (builder *requestBuilder) build(info Info) (req *unstructured.Unstructured, err error) {
 	results := []*report.PolicyReportResult{}
+	req = new(unstructured.Unstructured)
 	for _, infoResult := range info.Results {
 		for _, rule := range infoResult.Rules {
-			if rule.Type != utils.Validation.String() {
+			if rule.Type != utils.Validation.String() && rule.Type != utils.ImageVerify.String() {
 				continue
 			}
 
@@ -107,12 +114,19 @@ func (builder *requestBuilder) build(info Info) (req *unstructured.Unstructured,
 			Results: results,
 		}
 
-		obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(rr)
+		gv := report.SchemeGroupVersion
+		rr.SetGroupVersionKind(schema.GroupVersionKind{Group: gv.Group, Version: gv.Version, Kind: "ReportChangeRequest"})
+
+		rawRcr, err := json.Marshal(rr)
 		if err != nil {
 			return nil, err
 		}
 
-		req = &unstructured.Unstructured{Object: obj}
+		err = json.Unmarshal(rawRcr, req)
+		if err != nil {
+			return nil, err
+		}
+
 		set(req, info)
 	} else {
 		rr := &request.ClusterReportChangeRequest{
@@ -120,15 +134,23 @@ func (builder *requestBuilder) build(info Info) (req *unstructured.Unstructured,
 			Results: results,
 		}
 
-		obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(rr)
+		gv := report.SchemeGroupVersion
+		rr.SetGroupVersionKind(schema.GroupVersionKind{Group: gv.Group, Version: gv.Version, Kind: "ClusterReportChangeRequest"})
+
+		rawRcr, err := json.Marshal(rr)
 		if err != nil {
 			return nil, err
 		}
-		req = &unstructured.Unstructured{Object: obj}
+
+		err = json.Unmarshal(rawRcr, req)
+		if err != nil {
+			return nil, err
+		}
+
 		set(req, info)
 	}
 
-	if !setRequestLabels(req, info) {
+	if !setRequestDeletionLabels(req, info) {
 		if len(results) == 0 {
 			// return nil on empty result without a deletion
 			return nil, nil
@@ -160,7 +182,7 @@ func (builder *requestBuilder) buildRCRResult(policy string, resource response.R
 
 	result.Rule = rule.Name
 	result.Message = rule.Message
-	result.Result = report.PolicyResult(rule.Check)
+	result.Result = report.PolicyResult(rule.Status)
 	if result.Result == "fail" && !av.scored {
 		result.Result = "warn"
 	}
@@ -189,7 +211,7 @@ func set(obj *unstructured.Unstructured, info Info) {
 	})
 }
 
-func setRequestLabels(req *unstructured.Unstructured, info Info) bool {
+func setRequestDeletionLabels(req *unstructured.Unstructured, info Info) bool {
 	switch {
 	case isResourceDeletion(info):
 		req.SetAnnotations(map[string]string{
@@ -197,26 +219,28 @@ func setRequestLabels(req *unstructured.Unstructured, info Info) bool {
 			deletedAnnotationResourceKind: info.Results[0].Resource.Kind,
 		})
 
-		req.SetLabels(map[string]string{
-			resourceLabelNamespace: info.Results[0].Resource.Namespace,
-		})
+		labels := req.GetLabels()
+		labels[resourceLabelNamespace] = info.Results[0].Resource.Namespace
+		req.SetLabels(labels)
 		return true
 
 	case isPolicyDeletion(info):
 		req.SetKind("ReportChangeRequest")
 		req.SetGenerateName("rcr-")
-		req.SetLabels(map[string]string{
-			deletedLabelPolicy: info.PolicyName},
-		)
+
+		labels := req.GetLabels()
+		labels[deletedLabelPolicy] = info.PolicyName
+		req.SetLabels(labels)
 		return true
 
 	case isRuleDeletion(info):
 		req.SetKind("ReportChangeRequest")
 		req.SetGenerateName("rcr-")
-		req.SetLabels(map[string]string{
-			deletedLabelPolicy: info.PolicyName,
-			deletedLabelRule:   info.Results[0].Rules[0].Name},
-		)
+
+		labels := req.GetLabels()
+		labels[deletedLabelPolicy] = info.PolicyName
+		labels[deletedLabelRule] = info.Results[0].Rules[0].Name
+		req.SetLabels(labels)
 		return true
 	}
 
@@ -263,13 +287,29 @@ func buildViolatedRules(er *response.EngineResponse) []kyverno.ViolatedRule {
 			Type:    rule.Type,
 			Message: rule.Message,
 		}
-		vrule.Check = report.StatusFail
-		if rule.Success {
-			vrule.Check = report.StatusPass
-		}
+
+		vrule.Status = toPolicyResult(rule.Status)
 		violatedRules = append(violatedRules, vrule)
 	}
+
 	return violatedRules
+}
+
+func toPolicyResult(status response.RuleStatus) string {
+	switch status {
+	case response.RuleStatusPass:
+		return report.StatusPass
+	case response.RuleStatusFail:
+		return report.StatusFail
+	case response.RuleStatusError:
+		return report.StatusError
+	case response.RuleStatusWarn:
+		return report.StatusWarn
+	case response.RuleStatusSkip:
+		return report.StatusSkip
+	}
+
+	return ""
 }
 
 const categoryLabel string = "policies.kyverno.io/category"
@@ -331,7 +371,7 @@ func (builder *requestBuilder) fetchAnnotations(policy, ns string) map[string]st
 		}
 	}
 
-	return make(map[string]string, 0)
+	return make(map[string]string)
 }
 
 func isResourceDeletion(info Info) bool {

@@ -6,6 +6,10 @@ on:
 jobs:
   release-init-kyverno:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -16,6 +20,11 @@ jobs:
         uses: actions/setup-go@v2
         with:
           go-version: 1.16
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@main
+        with:
+          cosign-release: 'v1.4.1'
 
       - name: Cache Go modules
         uses: actions/cache@v1
@@ -40,12 +49,36 @@ jobs:
         with:
           install: true
 
+      - name: Set version
+        run: |
+          echo "KYVERNO_VERSION=$(git describe --match "v[0-9]*")"
+
       - name :  docker images publish
         run: |
+          make docker-publish-sigs
           make docker-publish-initContainer
+
+      - name: get digest
+        id: get-step
+        run: |
+          echo "::set-output name=digest::$(make docker-get-initContainer-digest)"
+
+      - name: Sign image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign \
+          -a "repo=${{ github.repository }}" \
+          -a "workflow=${{ github.workflow }}" \
+          -a "ref=${{ github.sha }}" \
+          ghcr.io/kyverno/kyvernopre@sha256:${{ steps.get-step.outputs.digest }}
 
   release-kyverno:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -56,6 +89,11 @@ jobs:
         uses: actions/setup-go@v2
         with:
           go-version: 1.16
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@main
+        with:
+          cosign-release: 'v1.4.1'
 
       - name: Cache Go modules
         uses: actions/cache@v1
@@ -79,13 +117,60 @@ jobs:
         id: buildx
         with:
           install: true
+
+      - name: Set version
+        run: |
+          echo "KYVERNO_VERSION=$(git describe --match "v[0-9]*")"
+          echo "KYVERNO_VERSION=$(git describe --match "v[0-9]*")" >> $GITHUB_ENV
+
+      - name: Generate SBOM JSON
+        uses: CycloneDX/gh-gomod-generate-sbom@v1
+        with:
+          version: v1
+          args: mod -licenses -json -output kyverno-v${{ env.KYVERNO_VERSION }}-bom.cdx.json
+          
+      - uses: actions/upload-artifact@v2
+        with:
+          name: kyverno-bom-cdx
+          path: kyverno-v*-bom.cdx.json
 
       - name :  docker images publish
         run: |
+          make docker-publish-sbom
           make docker-publish-kyverno
+
+      - name: get digest
+        id: get-step
+        run: |
+          echo "::set-output name=digest::$(make docker-get-kyverno-digest)"
+
+      - name: Sign image and SBOM
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign \
+          -a "repo=${{ github.repository }}" \
+          -a "workflow=${{ github.workflow }}" \
+          -a "ref=${{ github.sha }}" \
+          ghcr.io/kyverno/kyverno@sha256:${{ steps.get-step.outputs.digest }}
+          cosign attach sbom -sbom ./*-bom.cdx.json -type cyclonedx ghcr.io/kyverno/sbom:latest
+
+      - name: Trivy Scan Image
+        uses: aquasecurity/trivy-action@master
+        with: 
+          image-ref: 'ghcr.io/kyverno/kyverno:${{env.KYVERNO_VERSION}}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
 
   release-kyverno-cli:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -96,6 +181,11 @@ jobs:
         uses: actions/setup-go@v2
         with:
           go-version: 1.16
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@main
+        with:
+          cosign-release: 'v1.4.1'
 
       - name: Cache Go modules
         uses: actions/cache@v1
@@ -119,10 +209,29 @@ jobs:
         id: buildx
         with:
           install: true
+
+      - name: Set version
+        run: |
+          echo "KYVERNO_VERSION=$(git describe --match "v[0-9]*")"
 
       - name :  docker images publish
         run: |
           make docker-publish-cli
+
+      - name: get digest
+        id: get-step
+        run: |
+          echo "::set-output name=digest::$(make docker-get-cli-digest)"
+
+      - name: Sign image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign \
+          -a "repo=${{ github.repository }}" \
+          -a "workflow=${{ github.workflow }}" \
+          -a "ref=${{ github.sha }}" \
+          ghcr.io/kyverno/kyverno-cli@sha256:${{ steps.get-step.outputs.digest }}
   
   create-release:
     runs-on: ubuntu-latest

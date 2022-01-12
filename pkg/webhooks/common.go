@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/common"
 	"github.com/kyverno/kyverno/pkg/engine/response"
 	engineutils "github.com/kyverno/kyverno/pkg/engine/utils"
@@ -47,7 +47,7 @@ func getEnforceFailureErrorMsg(engineResponses []*response.EngineResponse) strin
 		if !er.IsSuccessful() && er.PolicyResponse.ValidationFailureAction == common.Enforce {
 			ruleToReason := make(map[string]string)
 			for _, rule := range er.PolicyResponse.Rules {
-				if !rule.Success {
+				if rule.Status != response.RuleStatusPass {
 					ruleToReason[rule.Name] = rule.Message
 				}
 			}
@@ -72,7 +72,7 @@ func getErrorMsg(engineReponses []*response.EngineResponse) string {
 			resourceInfo = fmt.Sprintf("%s/%s/%s", er.PolicyResponse.Resource.Kind, er.PolicyResponse.Resource.Namespace, er.PolicyResponse.Resource.Name)
 			str = append(str, fmt.Sprintf("failed policy %s:", er.PolicyResponse.Policy.Name))
 			for _, rule := range er.PolicyResponse.Rules {
-				if !rule.Success {
+				if rule.Status != response.RuleStatusPass {
 					str = append(str, rule.ToString())
 				}
 			}
@@ -117,9 +117,42 @@ func containsRBACInfo(policies ...[]*kyverno.ClusterPolicy) bool {
 	for _, policySlice := range policies {
 		for _, policy := range policySlice {
 			for _, rule := range policy.Spec.Rules {
-				if len(rule.MatchResources.Roles) > 0 || len(rule.MatchResources.ClusterRoles) > 0 || len(rule.ExcludeResources.Roles) > 0 || len(rule.ExcludeResources.ClusterRoles) > 0 {
-					return true
-				}
+				checkForRBACInfo(rule)
+			}
+		}
+	}
+	return false
+}
+
+func checkForRBACInfo(rule kyverno.Rule) bool {
+	if len(rule.MatchResources.Roles) > 0 || len(rule.MatchResources.ClusterRoles) > 0 || len(rule.ExcludeResources.Roles) > 0 || len(rule.ExcludeResources.ClusterRoles) > 0 {
+		return true
+	}
+	if len(rule.MatchResources.All) > 0 {
+		for _, rf := range rule.MatchResources.All {
+			if len(rf.UserInfo.Roles) > 0 || len(rf.UserInfo.ClusterRoles) > 0 {
+				return true
+			}
+		}
+	}
+	if len(rule.MatchResources.Any) > 0 {
+		for _, rf := range rule.MatchResources.Any {
+			if len(rf.UserInfo.Roles) > 0 || len(rf.UserInfo.ClusterRoles) > 0 {
+				return true
+			}
+		}
+	}
+	if len(rule.ExcludeResources.All) > 0 {
+		for _, rf := range rule.ExcludeResources.All {
+			if len(rf.UserInfo.Roles) > 0 || len(rf.UserInfo.ClusterRoles) > 0 {
+				return true
+			}
+		}
+	}
+	if len(rule.ExcludeResources.Any) > 0 {
+		for _, rf := range rule.ExcludeResources.Any {
+			if len(rf.UserInfo.Roles) > 0 || len(rf.UserInfo.ClusterRoles) > 0 {
+				return true
 			}
 		}
 	}

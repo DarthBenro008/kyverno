@@ -8,8 +8,6 @@ import (
 
 	"github.com/go-logr/logr"
 	openapiv2 "github.com/googleapis/gnostic/openapiv2"
-	certificates "k8s.io/api/certificates/v1beta1"
-	helperv1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -76,8 +74,6 @@ func (c *Client) NewDynamicSharedInformerFactory(defaultResync time.Duration) dy
 }
 
 //GetEventsInterface provides typed interface for events
-//TODO: can we use dynamic client to fetch the typed interface
-// or generate a kube client value to access the interface
 func (c *Client) GetEventsInterface() (event.EventInterface, error) {
 	return c.kclient.CoreV1().Events(""), nil
 }
@@ -134,7 +130,7 @@ func (c *Client) GetDynamicInterface() dynamic.Interface {
 func (c *Client) ListResource(apiVersion string, kind string, namespace string, lselector *meta.LabelSelector) (*unstructured.UnstructuredList, error) {
 	options := meta.ListOptions{}
 	if lselector != nil {
-		options = meta.ListOptions{LabelSelector: helperv1.FormatLabelSelector(lselector)}
+		options = meta.ListOptions{LabelSelector: meta.FormatLabelSelector(lselector)}
 	}
 
 	return c.getResourceInterface(apiVersion, kind, namespace).List(context.TODO(), options)
@@ -160,7 +156,7 @@ func (c *Client) CreateResource(apiVersion string, kind string, namespace string
 	if unstructuredObj := convertToUnstructured(obj); unstructuredObj != nil {
 		return c.getResourceInterface(apiVersion, kind, namespace).Create(context.TODO(), unstructuredObj, options)
 	}
-	return nil, fmt.Errorf("Unable to create resource ")
+	return nil, fmt.Errorf("unable to create resource ")
 }
 
 // UpdateResource updates object for the specified resource/namespace
@@ -173,7 +169,7 @@ func (c *Client) UpdateResource(apiVersion string, kind string, namespace string
 	if unstructuredObj := convertToUnstructured(obj); unstructuredObj != nil {
 		return c.getResourceInterface(apiVersion, kind, namespace).Update(context.TODO(), unstructuredObj, options)
 	}
-	return nil, fmt.Errorf("Unable to update resource ")
+	return nil, fmt.Errorf("unable to update resource ")
 }
 
 // UpdateStatusResource updates the resource "status" subresource
@@ -186,7 +182,7 @@ func (c *Client) UpdateStatusResource(apiVersion string, kind string, namespace 
 	if unstructuredObj := convertToUnstructured(obj); unstructuredObj != nil {
 		return c.getResourceInterface(apiVersion, kind, namespace).UpdateStatus(context.TODO(), unstructuredObj, options)
 	}
-	return nil, fmt.Errorf("Unable to update resource ")
+	return nil, fmt.Errorf("unable to update resource ")
 }
 
 func convertToUnstructured(obj interface{}) *unstructured.Unstructured {
@@ -195,15 +191,6 @@ func convertToUnstructured(obj interface{}) *unstructured.Unstructured {
 		return nil
 	}
 	return &unstructured.Unstructured{Object: unstructuredObj}
-}
-
-//To-Do remove this to use unstructured type
-func convertToCSR(obj *unstructured.Unstructured) (*certificates.CertificateSigningRequest, error) {
-	csr := certificates.CertificateSigningRequest{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), &csr); err != nil {
-		return nil, err
-	}
-	return &csr, nil
 }
 
 //IDiscovery provides interface to mange Kind and GVR mapping
@@ -358,7 +345,7 @@ func logDiscoveryErrors(err error, c ServerPreferredResources) {
 	discoveryError := err.(*discovery.ErrGroupDiscoveryFailed)
 	for gv, e := range discoveryError.Groups {
 		if gv.Group == "custom.metrics.k8s.io" || gv.Group == "metrics.k8s.io" || gv.Group == "external.metrics.k8s.io" {
-			// These error occur when Prometheus is installed as an external metrics server
+			// These errors occur when Prometheus is installed as an external metrics server
 			// See: https://github.com/kyverno/kyverno/issues/1490
 			c.log.V(3).Info("failed to retrieve metrics API group", "gv", gv)
 			continue

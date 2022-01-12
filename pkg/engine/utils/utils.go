@@ -2,12 +2,14 @@ package utils
 
 import (
 	"fmt"
-	jsonpatch "github.com/evanphx/json-patch/v5"
-	commonAnchor "github.com/kyverno/kyverno/pkg/engine/anchor/common"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"strconv"
 	"strings"
+
+	commonAnchor "github.com/kyverno/kyverno/pkg/engine/anchor"
+
+	jsonpatch "github.com/evanphx/json-patch/v5"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 //RuleType defines the type for rule
@@ -20,8 +22,8 @@ const (
 	Validation
 	//Generation type for generation rule
 	Generation
-	//All type for other rule operations(future)
-	All
+	// ImageVerify type for image verification
+	ImageVerify
 )
 
 func (ri RuleType) String() string {

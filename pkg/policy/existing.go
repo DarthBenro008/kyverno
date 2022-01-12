@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/common"
 	"github.com/kyverno/kyverno/pkg/engine"
 	"github.com/kyverno/kyverno/pkg/engine/response"
@@ -25,27 +25,12 @@ func (pc *PolicyController) processExistingResources(policy *kyverno.ClusterPoli
 	pc.rm.Drop()
 
 	for _, rule := range policy.Spec.Rules {
-		if !rule.HasValidate() {
+		if !rule.HasValidate() && !rule.HasVerifyImages() {
 			continue
 		}
 
-		match := rule.MatchResources
-		exclude := rule.ExcludeResources
-
-		for _, value := range match.Any {
-			pc.processExistingKinds(value.ResourceDescription.Kinds, policy, rule, logger)
-		}
-		for _, value := range match.All {
-			pc.processExistingKinds(value.ResourceDescription.Kinds, policy, rule, logger)
-		}
-		for _, value := range exclude.All {
-			pc.processExistingKinds(value.ResourceDescription.Kinds, policy, rule, logger)
-		}
-		for _, value := range exclude.Any {
-			pc.processExistingKinds(value.ResourceDescription.Kinds, policy, rule, logger)
-		}
-
-		pc.processExistingKinds(match.Kinds, policy, rule, logger)
+		matchKinds := rule.MatchKinds()
+		pc.processExistingKinds(matchKinds, policy, rule, logger)
 	}
 }
 
@@ -169,7 +154,6 @@ type resourceManager interface {
 }
 
 //Drop drop the cache after every rebuild interval mins
-//TODO: or drop based on the size
 func (rm *ResourceManager) Drop() {
 	timeSince := time.Since(rm.time)
 	if timeSince > time.Duration(rm.rebuildTime)*time.Second {

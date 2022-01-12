@@ -6,9 +6,10 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/engine"
 	"github.com/kyverno/kyverno/pkg/engine/variables"
+	"github.com/kyverno/kyverno/pkg/utils"
 )
 
 func generateCronJobRule(rule kyverno.Rule, controllers string, log logr.Logger) kyvernoRule {
@@ -34,22 +35,26 @@ func generateCronJobRule(rule kyverno.Rule, controllers string, log logr.Logger)
 	}
 	cronJobRule.Name = name
 
-	cronJobRule.MatchResources.Kinds = []string{engine.PodControllerCronJob}
-	if (jobRule.ExcludeResources) != nil && (len(jobRule.ExcludeResources.Kinds) > 0) {
-		cronJobRule.ExcludeResources.Kinds = []string{engine.PodControllerCronJob}
+	if len(jobRule.MatchResources.Any) > 0 {
+		rule := cronJobAnyAllAutogenRule(cronJobRule.MatchResources.Any)
+		cronJobRule.MatchResources.Any = rule
+	} else if len(jobRule.MatchResources.All) > 0 {
+		rule := cronJobAnyAllAutogenRule(cronJobRule.MatchResources.All)
+		cronJobRule.MatchResources.All = rule
+	} else {
+		cronJobRule.MatchResources.Kinds = []string{engine.PodControllerCronJob}
 	}
 
-	if (jobRule.Mutation != nil) && (jobRule.Mutation.Overlay != nil) {
-		newMutation := &kyverno.Mutation{
-			Overlay: map[string]interface{}{
-				"spec": map[string]interface{}{
-					"jobTemplate": jobRule.Mutation.Overlay,
-				},
-			},
+	if (jobRule.ExcludeResources) != nil && len(jobRule.ExcludeResources.Any) > 0 {
+		rule := cronJobAnyAllAutogenRule(cronJobRule.ExcludeResources.Any)
+		cronJobRule.ExcludeResources.Any = rule
+	} else if (jobRule.ExcludeResources) != nil && len(jobRule.ExcludeResources.All) > 0 {
+		rule := cronJobAnyAllAutogenRule(cronJobRule.ExcludeResources.All)
+		cronJobRule.ExcludeResources.All = rule
+	} else {
+		if (jobRule.ExcludeResources) != nil && (len(jobRule.ExcludeResources.Kinds) > 0) {
+			cronJobRule.ExcludeResources.Kinds = []string{engine.PodControllerCronJob}
 		}
-
-		cronJobRule.Mutation = newMutation.DeepCopy()
-		return *cronJobRule
 	}
 
 	if (jobRule.Mutation != nil) && (jobRule.Mutation.PatchStrategicMerge != nil) {
@@ -101,6 +106,49 @@ func generateCronJobRule(rule kyverno.Rule, controllers string, log logr.Logger)
 		return *cronJobRule
 	}
 
+	if (jobRule.Validation != nil) && len(jobRule.Validation.ForEachValidation) > 0 && jobRule.Validation.ForEachValidation != nil {
+		newForeachValidate := make([]*kyverno.ForEachValidation, len(jobRule.Validation.ForEachValidation))
+		for i, foreach := range rule.Validation.ForEachValidation {
+			newForeachValidate[i] = foreach
+		}
+		cronJobRule.Validation = &kyverno.Validation{
+			Message:           variables.FindAndShiftReferences(log, rule.Validation.Message, "spec/template", "pattern"),
+			ForEachValidation: newForeachValidate,
+		}
+		return *cronJobRule
+	}
+
+	if (jobRule.Mutation != nil) && len(jobRule.Mutation.ForEachMutation) > 0 && jobRule.Mutation.ForEachMutation != nil {
+
+		var newForeachMutation []*kyverno.ForEachMutation
+
+		for _, foreach := range rule.Mutation.ForEachMutation {
+			newForeachMutation = append(newForeachMutation, &kyverno.ForEachMutation{
+				List:             foreach.List,
+				Context:          foreach.Context,
+				AnyAllConditions: foreach.AnyAllConditions,
+				PatchStrategicMerge: map[string]interface{}{
+					"spec": map[string]interface{}{
+						"jobTemplate": foreach.PatchStrategicMerge,
+					},
+				},
+			})
+		}
+		cronJobRule.Mutation = &kyverno.Mutation{
+			ForEachMutation: newForeachMutation,
+		}
+		return *cronJobRule
+	}
+
+	if jobRule.VerifyImages != nil {
+		newVerifyImages := make([]*kyverno.ImageVerification, len(jobRule.VerifyImages))
+		for i, vi := range rule.VerifyImages {
+			newVerifyImages[i] = vi.DeepCopy()
+		}
+		cronJobRule.VerifyImages = newVerifyImages
+		return *cronJobRule
+	}
+
 	return kyvernoRule{}
 }
 
@@ -122,4 +170,14 @@ func stripCronJob(controllers string) string {
 	}
 
 	return strings.Join(newControllers, ",")
+}
+
+func cronJobAnyAllAutogenRule(v kyverno.ResourceFilters) kyverno.ResourceFilters {
+	anyKind := v.DeepCopy()
+	for i, value := range v {
+		if utils.ContainsPod(value.Kinds, "Job") {
+			anyKind[i].Kinds = []string{engine.PodControllerCronJob}
+		}
+	}
+	return anyKind
 }

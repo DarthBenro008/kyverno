@@ -1,7 +1,7 @@
 package engine
 
 import (
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	client "github.com/kyverno/kyverno/pkg/dclient"
 	"github.com/kyverno/kyverno/pkg/engine/context"
 	"github.com/kyverno/kyverno/pkg/resourcecache"
@@ -19,6 +19,9 @@ type PolicyContext struct {
 
 	// OldResource is the prior resource for an update, or nil
 	OldResource unstructured.Unstructured
+
+	// Element is set when the context is used for processing a foreach loop
+	Element unstructured.Unstructured
 
 	// AdmissionInfo contains the admission request information
 	AdmissionInfo kyverno.RequestInfo
@@ -39,4 +42,19 @@ type PolicyContext struct {
 
 	// NamespaceLabels stores the label of namespace to be processed by namespace selector
 	NamespaceLabels map[string]string
+}
+
+func (pc *PolicyContext) Copy() *PolicyContext {
+	return &PolicyContext{
+		Policy:              pc.Policy,
+		NewResource:         pc.NewResource,
+		OldResource:         pc.OldResource,
+		AdmissionInfo:       pc.AdmissionInfo,
+		Client:              pc.Client,
+		ExcludeGroupRole:    pc.ExcludeGroupRole,
+		ExcludeResourceFunc: pc.ExcludeResourceFunc,
+		ResourceCache:       pc.ResourceCache,
+		JSONContext:         pc.JSONContext,
+		NamespaceLabels:     pc.NamespaceLabels,
+	}
 }

@@ -1051,6 +1051,8 @@ func Test_Generate_Policy_Deletion_for_Clone(t *testing.T) {
 		err = commonE2E.PolicyCreated(tests.PolicyName)
 		Expect(err).NotTo(HaveOccurred())
 
+		time.Sleep(5 * time.Second)
+
 		// ======= Create Namespace ==================
 		By(fmt.Sprintf("Creating Namespace which triggers generate %s", clPolNS))
 		_, err = e2eClient.CreateClusteredResourceYaml(nsGVR, namespaceYaml)
@@ -1081,6 +1083,7 @@ func Test_Generate_Policy_Deletion_for_Clone(t *testing.T) {
 
 		// test: generated resource is not deleted after deletion of generate policy
 		// ========== Delete the Generate Policy =============
+		time.Sleep(2 * time.Second)
 		By(fmt.Sprintf("Delete the generate policy : %s", tests.PolicyName))
 
 		err = e2eClient.DeleteClusteredResource(clPolGVR, tests.PolicyName)
@@ -1102,8 +1105,15 @@ func Test_Generate_Policy_Deletion_for_Clone(t *testing.T) {
 
 		// ======= Check Generated Resources =======
 		By(fmt.Sprintf("Checking the generated resource (Configmap) in namespace : %s", tests.ResourceNamespace))
-		_, err = e2eClient.GetNamespacedResource(cmGVR, tests.ResourceNamespace, tests.ConfigMapName)
+		err = e2e.GetWithRetry(1*time.Second, 15, func() error {
+			_, err := e2eClient.GetNamespacedResource(cmGVR, tests.ResourceNamespace, tests.ConfigMapName)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
 		Expect(err).NotTo(HaveOccurred())
+
 		// ===========================================
 
 		// test: the generated resource is not updated if the source resource is updated

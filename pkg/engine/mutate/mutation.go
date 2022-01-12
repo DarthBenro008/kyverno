@@ -1,184 +1,128 @@
 package mutate
 
 import (
+	"encoding/json"
+	"fmt"
+
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
+	"github.com/kyverno/kyverno/pkg/engine/common"
 	"github.com/kyverno/kyverno/pkg/engine/context"
+	"github.com/kyverno/kyverno/pkg/engine/mutate/patch"
 	"github.com/kyverno/kyverno/pkg/engine/response"
-	"github.com/kyverno/kyverno/pkg/engine/utils"
+	"github.com/kyverno/kyverno/pkg/engine/variables"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// Handler knows how to mutate resources with given pattern
-type Handler interface {
-	Handle() (resp response.RuleResponse, newPatchedResource unstructured.Unstructured)
+type Response struct {
+	Status          response.RuleStatus
+	PatchedResource unstructured.Unstructured
+	Patches         [][]byte
+	Message         string
 }
 
-// CreateMutateHandler initilizes a new instance of mutation handler
-func CreateMutateHandler(ruleName string, mutate *kyverno.Mutation, patchedResource unstructured.Unstructured, context context.EvalInterface, logger logr.Logger) Handler {
+func newErrorResponse(msg string, err error) *Response {
+	return newResponse(response.RuleStatusError, unstructured.Unstructured{}, nil, fmt.Sprintf("%s: %v", msg, err))
+}
 
-	switch {
-	case isPatchStrategicMerge(mutate):
-		return newPatchStrategicMergeHandler(ruleName, mutate, patchedResource, context, logger)
-	case isPatchesJSON6902(mutate):
-		return newPatchesJSON6902Handler(ruleName, mutate, patchedResource, logger)
-	case isOverlay(mutate):
-		// return newOverlayHandler(ruleName, mutate, patchedResource, context, logger)
-		mutate.PatchStrategicMerge = mutate.Overlay
-		var a interface{}
-		mutate.Overlay = a
-		return newPatchStrategicMergeHandler(ruleName, mutate, patchedResource, context, logger)
-	case isPatches(mutate):
-		return newPatchesHandler(ruleName, mutate, patchedResource, context, logger)
-	default:
-		return newEmptyHandler(patchedResource)
+func newResponse(status response.RuleStatus, resource unstructured.Unstructured, patches [][]byte, msg string) *Response {
+	return &Response{
+		Status:          status,
+		PatchedResource: resource,
+		Patches:         patches,
+		Message:         msg,
 	}
 }
 
-// patchStrategicMergeHandler
-type patchStrategicMergeHandler struct {
-	ruleName        string
-	mutation        *kyverno.Mutation
-	patchedResource unstructured.Unstructured
-	evalCtx         context.EvalInterface
-	logger          logr.Logger
-}
-
-func newPatchStrategicMergeHandler(ruleName string, mutate *kyverno.Mutation, patchedResource unstructured.Unstructured, context context.EvalInterface, logger logr.Logger) Handler {
-	return patchStrategicMergeHandler{
-		ruleName:        ruleName,
-		mutation:        mutate,
-		patchedResource: patchedResource,
-		evalCtx:         context,
-		logger:          logger,
-	}
-}
-
-func (h patchStrategicMergeHandler) Handle() (response.RuleResponse, unstructured.Unstructured) {
-	return ProcessStrategicMergePatch(h.ruleName, h.mutation.PatchStrategicMerge, h.patchedResource, h.logger)
-}
-
-// overlayHandler
-type overlayHandler struct {
-	ruleName        string
-	mutation        *kyverno.Mutation
-	patchedResource unstructured.Unstructured
-	evalCtx         context.EvalInterface
-	logger          logr.Logger
-}
-
-func newOverlayHandler(ruleName string, mutate *kyverno.Mutation, patchedResource unstructured.Unstructured, context context.EvalInterface, logger logr.Logger) Handler {
-	return overlayHandler{
-		ruleName:        ruleName,
-		mutation:        mutate,
-		patchedResource: patchedResource,
-		evalCtx:         context,
-		logger:          logger,
-	}
-}
-
-// patchesJSON6902Handler
-type patchesJSON6902Handler struct {
-	ruleName        string
-	mutation        *kyverno.Mutation
-	patchedResource unstructured.Unstructured
-	evalCtx         context.EvalInterface
-	logger          logr.Logger
-}
-
-func newPatchesJSON6902Handler(ruleName string, mutate *kyverno.Mutation, patchedResource unstructured.Unstructured, logger logr.Logger) Handler {
-	return patchesJSON6902Handler{
-		ruleName:        ruleName,
-		mutation:        mutate,
-		patchedResource: patchedResource,
-		logger:          logger,
-	}
-}
-
-func (h patchesJSON6902Handler) Handle() (resp response.RuleResponse, patchedResource unstructured.Unstructured) {
-	resp.Name = h.ruleName
-	resp.Type = utils.Mutation.String()
-
-	patchesJSON6902, err := convertPatchesToJSON(h.mutation.PatchesJSON6902)
+func Mutate(rule *kyverno.Rule, ctx *context.Context, resource unstructured.Unstructured, logger logr.Logger) *Response {
+	updatedRule, err := variables.SubstituteAllInRule(logger, ctx, *rule)
 	if err != nil {
-		resp.Success = false
-		h.logger.Error(err, "error in type conversion")
-		resp.Message = err.Error()
-		return resp, h.patchedResource
+		return newErrorResponse("variable substitution failed", err)
 	}
 
-	return ProcessPatchJSON6902(h.ruleName, patchesJSON6902, h.patchedResource, h.logger)
-}
-
-func (h overlayHandler) Handle() (response.RuleResponse, unstructured.Unstructured) {
-	return ProcessOverlay(h.logger, h.ruleName, h.mutation.Overlay, h.patchedResource)
-}
-
-// patchesHandler
-type patchesHandler struct {
-	ruleName        string
-	mutation        *kyverno.Mutation
-	patchedResource unstructured.Unstructured
-	evalCtx         context.EvalInterface
-	logger          logr.Logger
-}
-
-func newPatchesHandler(ruleName string, mutate *kyverno.Mutation, patchedResource unstructured.Unstructured, context context.EvalInterface, logger logr.Logger) Handler {
-	return patchesHandler{
-		ruleName:        ruleName,
-		mutation:        mutate,
-		patchedResource: patchedResource,
-		evalCtx:         context,
-		logger:          logger,
+	m := updatedRule.Mutation
+	patcher := NewPatcher(updatedRule.Name, m.PatchStrategicMerge, m.PatchesJSON6902, resource, ctx, logger)
+	if patcher == nil {
+		return newResponse(response.RuleStatusError, resource, nil, "empty mutate rule")
 	}
-}
 
-func (h patchesHandler) Handle() (resp response.RuleResponse, patchedResource unstructured.Unstructured) {
-	resp.Name = h.ruleName
-	resp.Type = utils.Mutation.String()
-
-	return ProcessPatches(h.logger, h.ruleName, *h.mutation, h.patchedResource)
-}
-
-// emptyHandler
-type emptyHandler struct {
-	patchedResource unstructured.Unstructured
-}
-
-func newEmptyHandler(patchedResource unstructured.Unstructured) Handler {
-	return emptyHandler{
-		patchedResource: patchedResource,
+	resp, patchedResource := patcher.Patch()
+	if resp.Status != response.RuleStatusPass {
+		return newResponse(resp.Status, resource, nil, resp.Message)
 	}
-}
 
-func (h emptyHandler) Handle() (response.RuleResponse, unstructured.Unstructured) {
-	return response.RuleResponse{}, h.patchedResource
-}
-
-func isPatchStrategicMerge(mutate *kyverno.Mutation) bool {
-	if mutate.PatchStrategicMerge != nil {
-		return true
+	if resp.Patches == nil {
+		return newResponse(response.RuleStatusSkip, resource, nil, "no patches applied")
 	}
-	return false
+
+	if err := ctx.AddResourceAsObject(patchedResource.Object); err != nil {
+		return newErrorResponse("failed to update patched resource in the JSON context", err)
+	}
+
+	return newResponse(response.RuleStatusPass, patchedResource, resp.Patches, resp.Message)
 }
 
-func isPatchesJSON6902(mutate *kyverno.Mutation) bool {
-	if len(mutate.PatchesJSON6902) > 0 {
-		return true
+func ForEach(name string, foreach *kyverno.ForEachMutation, ctx *context.Context, resource unstructured.Unstructured, logger logr.Logger) *Response {
+	fe, err := substituteAllInForEach(foreach, ctx, logger)
+	if err != nil {
+		return newErrorResponse("variable substitution failed", err)
 	}
-	return false
+
+	patcher := NewPatcher(name, fe.PatchStrategicMerge, fe.PatchesJSON6902, resource, ctx, logger)
+	if patcher == nil {
+		return newResponse(response.RuleStatusError, unstructured.Unstructured{}, nil, "no patches found")
+	}
+
+	resp, patchedResource := patcher.Patch()
+	if resp.Status != response.RuleStatusPass {
+		return newResponse(resp.Status, unstructured.Unstructured{}, nil, resp.Message)
+	}
+
+	if resp.Patches == nil {
+		return newResponse(response.RuleStatusSkip, unstructured.Unstructured{}, nil, "no patches applied")
+	}
+
+	if err := ctx.AddResourceAsObject(patchedResource.Object); err != nil {
+		return newErrorResponse("failed to update patched resource in the JSON context", err)
+	}
+
+	return newResponse(response.RuleStatusPass, patchedResource, resp.Patches, resp.Message)
 }
 
-func isOverlay(mutate *kyverno.Mutation) bool {
-	if mutate.Overlay != nil {
-		return true
+func substituteAllInForEach(fe *kyverno.ForEachMutation, ctx *context.Context, logger logr.Logger) (*kyverno.ForEachMutation, error) {
+	jsonObj, err := common.ToMap(fe)
+	if err != nil {
+		return nil, err
 	}
-	return false
+
+	data, err := variables.SubstituteAll(logger, ctx, jsonObj)
+	if err != nil {
+		return nil, err
+	}
+
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+
+	var updatedForEach kyverno.ForEachMutation
+	if err := json.Unmarshal(bytes, &updatedForEach); err != nil {
+		return nil, err
+	}
+
+	return &updatedForEach, nil
 }
 
-func isPatches(mutate *kyverno.Mutation) bool {
-	if len(mutate.Patches) != 0 {
-		return true
+func NewPatcher(name string, strategicMergePatch apiextensions.JSON, jsonPatch string, r unstructured.Unstructured, ctx *context.Context, logger logr.Logger) patch.Patcher {
+	if strategicMergePatch != nil {
+		return patch.NewPatchStrategicMerge(name, strategicMergePatch, r, ctx, logger)
 	}
-	return false
+
+	if len(jsonPatch) > 0 {
+		return patch.NewPatchesJSON6902(name, jsonPatch, r, logger)
+	}
+
+	return nil
 }

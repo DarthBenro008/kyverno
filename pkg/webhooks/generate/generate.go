@@ -7,7 +7,7 @@ import (
 	backoff "github.com/cenkalti/backoff"
 	"github.com/gardener/controller-manager-library/pkg/logger"
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	kyvernoclient "github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	kyvernoinformer "github.com/kyverno/kyverno/pkg/client/informers/externalversions/kyverno/v1"
 	kyvernolister "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1"
@@ -116,8 +116,6 @@ func retryApplyResource(client *kyvernoclient.Clientset, grSpec kyverno.Generate
 
 		gr.SetNamespace(config.KyvernoNamespace)
 		// Initial state "Pending"
-		// TODO: status is not updated
-		// gr.Status.State = kyverno.Pending
 		// generate requests created in kyverno namespace
 		isExist := false
 		if action == v1beta1.Create || action == v1beta1.Update {

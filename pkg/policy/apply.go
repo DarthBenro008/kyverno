@@ -9,7 +9,7 @@ import (
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	"github.com/go-logr/logr"
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
 	client "github.com/kyverno/kyverno/pkg/dclient"
 	"github.com/kyverno/kyverno/pkg/engine"
 	"github.com/kyverno/kyverno/pkg/engine/context"
@@ -128,7 +128,7 @@ func getFailedOverallRuleInfo(resource unstructured.Unstructured, engineResponse
 
 		if !jsonpatch.Equal(patchedResource, rawResource) {
 			log.V(4).Info("policy rule conditions not satisfied by resource", "rule", rule.Name)
-			engineResponse.PolicyResponse.Rules[index].Success = false
+			engineResponse.PolicyResponse.Rules[index].Status = response.RuleStatusFail
 			engineResponse.PolicyResponse.Rules[index].Message = fmt.Sprintf("mutation json patches not found at resource path %s", extractPatchPath(patches, log))
 		}
 	}

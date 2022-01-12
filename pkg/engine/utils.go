@@ -1,13 +1,21 @@
 package engine
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"time"
 
-	kyverno "github.com/kyverno/kyverno/pkg/api/kyverno/v1"
+	"github.com/kyverno/kyverno/pkg/engine/common"
+
+	"github.com/go-logr/logr"
+	kyverno "github.com/kyverno/kyverno/api/kyverno/v1"
+	"github.com/kyverno/kyverno/pkg/engine/context"
+	"github.com/kyverno/kyverno/pkg/engine/response"
+	engineUtils "github.com/kyverno/kyverno/pkg/engine/utils"
+	"github.com/kyverno/kyverno/pkg/engine/variables"
+	"github.com/pkg/errors"
+
 	"github.com/kyverno/kyverno/pkg/engine/wildcards"
 	"github.com/kyverno/kyverno/pkg/utils"
 	"github.com/minio/pkg/wildcard"
@@ -32,7 +40,7 @@ func checkKind(kinds []string, resource unstructured.Unstructured) bool {
 	for _, kind := range kinds {
 		SplitGVK := strings.Split(kind, "/")
 		if len(SplitGVK) == 1 {
-			if resource.GetKind() == strings.Title(kind) {
+			if resource.GetKind() == strings.Title(kind) || kind == "*" {
 				return true
 			}
 		} else if len(SplitGVK) == 2 {
@@ -256,15 +264,18 @@ func matchSubjects(ruleSubjects []rbacv1.Subject, userInfo authenticationv1.User
 }
 
 //MatchesResourceDescription checks if the resource matches resource description of the rule or not
-func MatchesResourceDescription(resourceRef unstructured.Unstructured, ruleRef kyverno.Rule, admissionInfoRef kyverno.RequestInfo, dynamicConfig []string, namespaceLabels map[string]string) error {
+func MatchesResourceDescription(resourceRef unstructured.Unstructured, ruleRef kyverno.Rule, admissionInfoRef kyverno.RequestInfo, dynamicConfig []string, namespaceLabels map[string]string, policyNamespace string) error {
 
-	rule := *ruleRef.DeepCopy()
+	rule := ruleRef.DeepCopy()
 	resource := *resourceRef.DeepCopy()
 	admissionInfo := *admissionInfoRef.DeepCopy()
 
 	var reasonsForFailure []error
+	if policyNamespace != "" && policyNamespace != resourceRef.GetNamespace() {
+		return errors.New(" The policy and resource namespace are different. Therefore, policy skip this resource.")
+	}
 	if len(rule.MatchResources.Any) > 0 {
-		// inlcude object if ANY of the criterias match
+		// include object if ANY of the criteria match
 		// so if one matches then break from loop
 		oneMatched := false
 		for _, rmr := range rule.MatchResources.Any {
@@ -368,7 +379,7 @@ func copyAnyAllConditions(original kyverno.AnyAllConditions) kyverno.AnyAllCondi
 
 // backwards compatibility
 func copyOldConditions(original []kyverno.Condition) []kyverno.Condition {
-	if original == nil || len(original) == 0 {
+	if len(original) == 0 {
 		return []kyverno.Condition{}
 	}
 
@@ -392,7 +403,8 @@ func transformConditions(original apiextensions.JSON) (interface{}, error) {
 	case []kyverno.Condition: // backwards compatibility
 		return copyOldConditions(typedValue), nil
 	}
-	return nil, fmt.Errorf("wrongfully configured data")
+
+	return nil, fmt.Errorf("invalid preconditions")
 }
 
 // excludeResource checks if the resource has ownerRef set
@@ -430,4 +442,55 @@ func ManagedPodResource(policy kyverno.ClusterPolicy, resource unstructured.Unst
 	}
 
 	return false
+}
+
+func checkPreconditions(logger logr.Logger, ctx *PolicyContext, anyAllConditions apiextensions.JSON) (bool, error) {
+	preconditions, err := variables.SubstituteAllInPreconditions(logger, ctx.JSONContext, anyAllConditions)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to substitute variables in preconditions")
+	}
+
+	typeConditions, err := common.TransformConditions(preconditions)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to parse preconditions")
+	}
+
+	pass := variables.EvaluateConditions(logger, ctx.JSONContext, typeConditions)
+	return pass, nil
+}
+
+func evaluateList(jmesPath string, ctx context.EvalInterface) ([]interface{}, error) {
+	i, err := ctx.Query(jmesPath)
+	if err != nil {
+		return nil, err
+	}
+
+	l, ok := i.([]interface{})
+	if !ok {
+		return []interface{}{i}, nil
+	}
+
+	return l, nil
+}
+
+func ruleError(rule *kyverno.Rule, ruleType engineUtils.RuleType, msg string, err error) *response.RuleResponse {
+	msg = fmt.Sprintf("%s: %s", msg, err.Error())
+	return ruleResponse(rule, ruleType, msg, response.RuleStatusError)
+}
+
+func ruleResponse(rule *kyverno.Rule, ruleType engineUtils.RuleType, msg string, status response.RuleStatus) *response.RuleResponse {
+	return &response.RuleResponse{
+		Name:    rule.Name,
+		Type:    ruleType.String(),
+		Message: msg,
+		Status:  status,
+	}
+}
+
+func incrementAppliedCount(resp *response.EngineResponse) {
+	resp.PolicyResponse.RulesAppliedCount++
+}
+
+func incrementErrorCount(resp *response.EngineResponse) {
+	resp.PolicyResponse.RulesErrorCount++
 }
