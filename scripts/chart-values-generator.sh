@@ -5,7 +5,7 @@ NAME_OVERRIDE_VALUE=""
 FULLNAME_OVERRIDE_VALUE=""
 NAMESPACE_VALUE=""
 TAG_VALUE=""
-
+CHART_LOCATION="${BASH_SOURCE%/*}/../charts/kyverno/values.yaml"
 
 print_usage(){
     echo "
@@ -284,5 +284,5 @@ networkPolicy:
   namespaceLabels: {}
   podExpressions: [{}]
   podLabels: {}
-" > ../charts/kyverno/values.yaml
+" > $CHART_LOCATION
 echo "Values generated"
